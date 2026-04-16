@@ -5,7 +5,7 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "discover_pools", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions", "set_position_note"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
   "update_config",
@@ -96,7 +96,7 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "deepseek/deepseek-v3.2";
 
 const TOOL_REQUIRED_INTENTS = /\b(deploy|open position|open|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|self.?update|pull latest|git pull|update yourself|config|setting|threshold|set |change|update |balance|wallet|position|portfolio|pnl|yield|range|screen|candidate|find pool|search|research|token|smart wallet|whale|watch.?list|tracked wallet|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|lesson|learned|teach|pin|unpin)\b/i;
 
@@ -248,12 +248,18 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        // Hermes sometimes returns null content — pop the empty message and retry once
+        // Hermes sometimes returns null content — pop the empty message and retry up to 3 times
         if (!msg.content) {
+          emptyStreak += 1;
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          if (emptyStreak >= 3) {
+            log("agent", `Empty response streak limit reached (${emptyStreak}). Aborting.`);
+            return { content: "Agent received too many empty responses from the model. Please retry or check the model.", userMessage: goal };
+          }
+          log("agent", `Empty response (streak: ${emptyStreak}/3), retrying...`);
           continue;
         }
+        emptyStreak = 0; // reset streak on any valid content
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
           messages.pop();
@@ -295,8 +301,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
 
+        // Optimistic lock — record whether it was already fired BEFORE setting the lock,
+        // then set the lock immediately (before any await) so parallel calls in the same
+        // Promise.all step both see it and the second one is blocked.
+        const wasAlreadyFired = firedOnce.has(functionName);
+        if (ONCE_PER_SESSION.has(functionName) || NO_RETRY_TOOLS.has(functionName)) {
+          firedOnce.add(functionName); // lock now, before await — fixes parallel call race
+        }
+
         // Block once-per-session tools from firing a second time
-        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
+        if (ONCE_PER_SESSION.has(functionName) && wasAlreadyFired) {
           log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
           await onToolFinish?.({
             name: functionName,
@@ -322,10 +336,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        // Note: firedOnce was already set optimistically above (before the await).
+        // For ONCE_PER_SESSION non-NO_RETRY tools (close/swap): if the call failed,
+        // remove the lock so a genuine retry is allowed in a subsequent step.
+        if (ONCE_PER_SESSION.has(functionName) && !NO_RETRY_TOOLS.has(functionName) && result?.success === false && !result?.blocked) {
+          firedOnce.delete(functionName);
+        }
 
         return {
           role: "tool",

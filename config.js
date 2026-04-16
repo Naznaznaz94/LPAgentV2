@@ -27,6 +27,7 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    maxFeeActiveTvlRatio: u.maxFeeActiveTvlRatio ?? null,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl            ?? 150_000,
     minVolume:         u.minVolume         ?? 500,
@@ -46,12 +47,19 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    minAthPct:          u.minAthPct          ?? null, // e.g. 70 = only deploy if price is >= 70% of ATH (near-ATH strategy)
+    minFeePct:          u.minFeePct          ?? 0.8,  // minimum pool base fee % (e.g. 0.8 = 0.8%)
+    avoidPvpSymbols:    u.avoidPvpSymbols    ?? false, // enrich PVP risk data for candidates
+    blockPvpSymbols:    u.blockPvpSymbols    ?? false, // hard-block pools flagged as PVP
   },
 
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    poolMaxDeploys:        u.poolMaxDeploys        ?? 4,   // max deploys per pool within rolling window
+    poolDeployWindowDays:  u.poolDeployWindowDays  ?? 3,   // rolling window in days
+    poolCooldownHours:     u.poolCooldownHours     ?? 36,  // cooldown after hitting limit
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
@@ -92,9 +100,21 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v3.2",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v3.2",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v3.2",
+  },
+
+  // ─── Darwinian Signal Weighting ────────
+  darwin: {
+    enabled:      u.darwinEnabled      ?? true,
+    windowDays:   u.darwinWindowDays   ?? 60,
+    recalcEvery:  u.darwinRecalcEvery  ?? 5,
+    boostFactor:  u.darwinBoost        ?? 1.05,
+    decayFactor:  u.darwinDecay        ?? 0.95,
+    weightFloor:  u.darwinFloor        ?? 0.3,
+    weightCeiling: u.darwinCeiling     ?? 2.5,
+    minSamples:   u.darwinMinSamples   ?? 10,
   },
 
   // ─── Common Token Mints ────────────────
@@ -153,7 +173,13 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
-    if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
-    if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
+    if (fresh.minAthPct         !== undefined) s.minAthPct        = fresh.minAthPct;
+    if (fresh.maxBundlePct          != null)      s.maxBundlePct          = fresh.maxBundlePct;
+    if (fresh.maxBotHoldersPct      != null)      s.maxBotHoldersPct      = fresh.maxBotHoldersPct;
+    if (fresh.maxTop10Pct           != null)      s.maxTop10Pct           = fresh.maxTop10Pct;
+    if (fresh.maxFeeActiveTvlRatio  != null)      s.maxFeeActiveTvlRatio  = fresh.maxFeeActiveTvlRatio;
+    if (fresh.minTokenFeesSol       != null)      s.minTokenFeesSol       = fresh.minTokenFeesSol;
+    if (fresh.minFeePct             != null)      s.minFeePct             = fresh.minFeePct;
+    if (fresh.blockedLaunchpads     !== undefined) s.blockedLaunchpads    = fresh.blockedLaunchpads;
   } catch { /* ignore */ }
 }

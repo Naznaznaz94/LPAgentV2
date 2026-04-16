@@ -231,9 +231,14 @@ export async function createLiveMessage(title, intro = "Starting...") {
     if (!state.messageId) {
       const sent = await sendMessage(text);
       state.messageId = sent?.result?.message_id ?? null;
-      return;
+    } else {
+      await editMessage(text, state.messageId);
     }
-    await editMessage(text, state.messageId);
+    // If more updates arrived while we were flushing, schedule a follow-up
+    if (state.flushRequested) {
+      state.flushRequested = false;
+      scheduleFlush(300);
+    }
   }
 
   function scheduleFlush(delay = 300) {

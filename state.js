@@ -9,9 +9,12 @@
  */
 
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
-const STATE_FILE = "./state.json";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STATE_FILE = path.join(__dirname, "state.json");
 
 const MAX_RECENT_EVENTS = 20;
 const MAX_INSTRUCTION_LENGTH = 280;
@@ -35,7 +38,7 @@ function load() {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    return { positions: {}, recentEvents: [], lastUpdated: null };
   }
 }
 
@@ -57,6 +60,7 @@ export function trackPosition({
   position,
   pool,
   pool_name,
+  base_mint = null,
   strategy,
   bin_range = {},
   amount_sol,
@@ -74,6 +78,7 @@ export function trackPosition({
     position,
     pool,
     pool_name,
+    base_mint,
     strategy,
     bin_range,
     amount_sol,
@@ -209,6 +214,31 @@ export function recordRebalance(old_position, new_position) {
 }
 
 /**
+ * Validate that a position instruction looks like a legitimate LP condition.
+ * Returns true only if it contains numeric conditions or known action keywords,
+ * and does not contain suspicious patterns like URLs or code-like syntax.
+ */
+function isValidInstruction(text) {
+  if (!text) return true; // null/empty = clear instruction, always valid
+  if (text.length > 200) return false; // unusually long = suspicious
+
+  // Reject URLs
+  if (/https?:\/\//i.test(text)) return false;
+
+  // Reject code-like syntax: function calls with args e.g. foo(bar, baz)
+  if (/\w+\s*\([^)]{3,}\)/.test(text)) return false;
+
+  // Reject backtick / eval-like patterns
+  if (/`|eval\s*\(|exec\s*\(/i.test(text)) return false;
+
+  // Must contain at least one numeric value OR a known action keyword
+  const hasNumber = /\d/.test(text);
+  const hasKeyword = /\b(close|hold|claim|profit|loss|pnl|sell|take|stop|oor|out.of.range|trailing|drop|gain|percent|usd|sol)\b/i.test(text);
+
+  return hasNumber || hasKeyword;
+}
+
+/**
  * Set a persistent instruction for a position (e.g. "hold until 5% profit").
  * Overwrites any previous instruction. Pass null to clear.
  */
@@ -216,7 +246,15 @@ export function setPositionInstruction(position_address, instruction) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return false;
-  pos.instruction = sanitizeStoredText(instruction);
+
+  const sanitized = sanitizeStoredText(instruction);
+
+  if (!isValidInstruction(sanitized)) {
+    log("state", `Position ${position_address} instruction rejected (failed validation): ${sanitized}`);
+    return { error: "Instruction rejected: must contain a numeric condition or action keyword (close/hold/claim/profit/loss/pnl). URLs and code syntax are not allowed." };
+  }
+
+  pos.instruction = sanitized;
   save(state);
   log("state", `Position ${position_address} instruction set: ${pos.instruction}`);
   return true;
@@ -224,6 +262,7 @@ export function setPositionInstruction(position_address, instruction) {
 
 export function queuePeakConfirmation(position_address, candidatePnlPct) {
   if (candidatePnlPct == null) return false;
+  if (!Number.isFinite(candidatePnlPct)) return false; // guard against NaN/Infinity
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return false;
@@ -253,7 +292,8 @@ export function resolvePendingPeak(position_address, currentPnlPct, toleranceRat
   pos.pending_peak_pnl_pct = null;
   pos.pending_peak_started_at = null;
 
-  if (currentPnlPct != null && currentPnlPct >= pendingPeak * toleranceRatio) {
+  // Only confirm peaks that are positive — a negative or zero pendingPeak is garbage data
+  if (pendingPeak > 0 && currentPnlPct != null && Number.isFinite(currentPnlPct) && currentPnlPct >= pendingPeak * toleranceRatio) {
     pos.peak_pnl_pct = Math.max(pos.peak_pnl_pct ?? 0, pendingPeak, currentPnlPct);
     save(state);
     log("state", `Position ${position_address} peak PnL confirmed at ${pos.peak_pnl_pct.toFixed(2)}% after recheck`);
@@ -312,7 +352,7 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   if (stillNearCrash && stillDroppedEnough) {
     const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
     pos.confirmed_trailing_exit_reason = reason;
-    pos.confirmed_trailing_exit_until = new Date(Date.now() + 30_000).toISOString();
+    pos.confirmed_trailing_exit_until = new Date(Date.now() + 90_000).toISOString(); // 90s window — safely > 30s poll interval
     save(state);
     log("state", `Position ${position_address} trailing drop confirmed after recheck: pending drop ${pendingDrop.toFixed(2)}%, current ${currentPnlPct.toFixed(2)}%`);
     return { confirmed: true, reason };
@@ -321,6 +361,19 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   save(state);
   log("state", `Position ${position_address} rejected trailing drop after 15s recheck (pending current: ${pendingCurrent.toFixed(2)}%, current: ${currentPnlPct ?? "?"}%)`);
   return { confirmed: false, rejected: true };
+}
+
+/**
+ * Attach a signal snapshot to a position after deploy (called from executor.js).
+ */
+export function updateSignalSnapshot(position_address, signal_snapshot) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return false;
+  pos.signal_snapshot = signal_snapshot;
+  save(state);
+  log("state", `Signal snapshot saved for ${position_address}`);
+  return true;
 }
 
 /**
@@ -428,14 +481,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && pos.trailing_active) {
-    const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
+  if (!pnl_pct_suspicious && pos.trailing_active && currentPnlPct != null && Number.isFinite(currentPnlPct)) {
+    const peakPnl = Number.isFinite(pos.peak_pnl_pct) ? pos.peak_pnl_pct : 0;
+    const dropFromPeak = peakPnl - currentPnlPct;
     if (dropFromPeak >= mgmtConfig.trailingDropPct) {
       return {
         action: "TRAILING_TP",
-        reason: `Trailing TP: peak ${pos.peak_pnl_pct.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
+        reason: `Trailing TP: peak ${peakPnl.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}% >= ${mgmtConfig.trailingDropPct}%)`,
         needs_confirmation: true,
-        peak_pnl_pct: pos.peak_pnl_pct,
+        peak_pnl_pct: peakPnl,
         current_pnl_pct: currentPnlPct,
         drop_from_peak_pct: dropFromPeak,
       };
@@ -456,11 +510,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Low yield (only after position has had time to accumulate fees) ───
   const { age_minutes } = positionData;
   const minAgeForYieldCheck = mgmtConfig.minAgeBeforeYieldCheck ?? 60;
+  // age_minutes == null means we don't know the age (e.g. API didn't return createdAt).
+  // Do NOT treat unknown age as "old enough" — require a known age to trigger low-yield close.
   if (
     fee_per_tvl_24h != null &&
     mgmtConfig.minFeePerTvl24h != null &&
     fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (age_minutes == null || age_minutes >= minAgeForYieldCheck)
+    age_minutes != null && age_minutes >= minAgeForYieldCheck
   ) {
     return {
       action: "LOW_YIELD",

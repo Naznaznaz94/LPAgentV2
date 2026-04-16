@@ -8,11 +8,15 @@ const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
-
+// SOL mint — only screen pools where the quote token is native SOL
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 /**
  * Fetch pools from the Meteora Pool Discovery API.
+ * Fetches both trending + volume in parallel (page_size 100 each), merges, deduplicates
+ * by pool address, then deduplicates by base token keeping the best fee/tvl pool per token.
  * Returns condensed data optimized for LLM consumption (saves tokens).
+ * Only returns TOKEN/SOL pools — USDC and other quote tokens are excluded.
  */
 export async function discoverPools({
   page_size = 50,
@@ -23,6 +27,7 @@ export async function discoverPools({
     "quote_token_has_critical_warnings=false",
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
+    `quote_token_address=${SOL_MINT}`,  // SOL-only pools
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
@@ -32,30 +37,73 @@ export async function discoverPools({
     `dlmm_bin_step>=${s.minBinStep}`,
     `dlmm_bin_step<=${s.maxBinStep}`,
     `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
+    s.maxFeeActiveTvlRatio != null ? `fee_active_tvl_ratio<=${s.maxFeeActiveTvlRatio}` : null,
     `base_token_organic_score>=${s.minOrganic}`,
     "quote_token_organic_score>=60",
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
     s.maxTokenAgeHours != null ? `base_token_created_at>=${Date.now() - s.maxTokenAgeHours * 3_600_000}` : null,
   ].filter(Boolean).join("&&");
 
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=${page_size}` +
-    `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${s.timeframe}` +
-    `&category=${s.category}`;
+  const encodedFilters = encodeURIComponent(filters);
+  const buildUrl = (category) =>
+    `${POOL_DISCOVERY_BASE}/pools?page_size=${page_size}&filter_by=${encodedFilters}&timeframe=${s.timeframe}&category=${category}`;
 
-  const res = await fetch(url);
+  // Fetch trending + top in parallel
+  const [trendingRes, topRes] = await Promise.allSettled([
+    fetch(buildUrl("trending")).then((r) => {
+      if (!r.ok) throw new Error(`Pool Discovery API error (trending): ${r.status} ${r.statusText}`);
+      return r.json();
+    }),
+    fetch(buildUrl("top")).then((r) => {
+      if (!r.ok) throw new Error(`Pool Discovery API error (top): ${r.status} ${r.statusText}`);
+      return r.json();
+    }),
+  ]);
 
-  if (!res.ok) {
-    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
+  // Merge and deduplicate by pool address — trending results ranked first
+  const seenPools = new Set();
+  const merged = [];
+  const succeededCategories = [];
+  const categories = ["trending", "top"];
+  for (const [i, res] of [trendingRes, topRes].entries()) {
+    if (res.status !== "fulfilled") {
+      log("screening", `Pool Discovery fetch failed (${categories[i]}): ${res.reason}`);
+      continue;
+    }
+    succeededCategories.push(categories[i]);
+    for (const pool of (res.value.data || [])) {
+      if (!seenPools.has(pool.pool_address)) {
+        seenPools.add(pool.pool_address);
+        merged.push(pool);
+      }
+    }
   }
 
-  const data = await res.json();
+  // Deduplicate by base token — keep highest fee_active_tvl_ratio pool per token
+  // Prevents same token eating multiple candidate slots (e.g. BURNIE-SOL pool A and B)
+  const bestByMint = new Map();
+  for (const pool of merged) {
+    const mint = pool.token_x?.address;
+    if (!mint) continue;
+    const existing = bestByMint.get(mint);
+    if (!existing || (pool.fee_active_tvl_ratio ?? 0) > (existing.fee_active_tvl_ratio ?? 0)) {
+      bestByMint.set(mint, pool);
+    }
+  }
+  const deduped = Array.from(bestByMint.values());
+  log("screening", `Dual-pass discovery: ${merged.length} pools → ${deduped.length} unique tokens (${succeededCategories.join(" + ") || "none succeeded"})`);
 
-  const condensed = (data.data || []).map(condensePool);
+  const condensed = deduped.map(condensePool);
+
+  // Hard-filter: SOL quote only — drop any non-SOL pool that slipped through the API filter
+  const nonSol = condensed.filter((p) => p.quote?.mint !== SOL_MINT);
+  if (nonSol.length > 0) {
+    log("screening", `SOL filter: dropped ${nonSol.length} non-SOL pool(s): ${nonSol.map(p => p.name).join(", ")}`);
+  }
+  const solOnly = condensed.filter((p) => p.quote?.mint === SOL_MINT);
 
   // Hard-filter blacklisted tokens and blocked deployers (what pool discovery already gave us)
-  let pools = condensed.filter((p) => {
+  let pools = solOnly.filter((p) => {
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
       return false;
@@ -104,7 +152,7 @@ export async function discoverPools({
   }
 
   return {
-    total: data.total,
+    total: pools.length,
     pools,
   };
 }
@@ -115,7 +163,8 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
-  const { pools } = await discoverPools({ page_size: 50 });
+  // Fetch 3× the target limit so OKX filters (wash, bundle, ATH, fees) have backfill headroom
+  const { pools } = await discoverPools({ page_size: 100 });
   const filteredOut = [];
 
   // Exclude pools where the wallet already has an open position
@@ -144,22 +193,53 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, "token cooldown active");
         return false;
       }
+      if (p.fee_pct != null && p.fee_pct < config.screening.minFeePct) {
+        log("screening", `Filtered low-fee pool ${p.name} — fee_pct ${p.fee_pct}% < min ${config.screening.minFeePct}%`);
+        pushFilteredReason(filteredOut, p, `fee_pct ${p.fee_pct}% below minimum ${config.screening.minFeePct}%`);
+        return false;
+      }
+      const maxFee = config.screening.maxFeeActiveTvlRatio;
+      if (maxFee != null && p.fee_active_tvl_ratio != null && p.fee_active_tvl_ratio > maxFee) {
+        log("screening", `Filtered pump-peak pool ${p.name} — fee_tvl ${p.fee_active_tvl_ratio} > max ${maxFee}`);
+        pushFilteredReason(filteredOut, p, `fee_tvl ${p.fee_active_tvl_ratio} above max ${maxFee} (pump peak)`);
+        return false;
+      }
       return true;
     })
-    .slice(0, limit);
+    .slice(0, limit * 3); // keep 3× headroom — OKX filters reduce this to final limit
 
-  if (config.screening.avoidPvpSymbols && eligible.length > 0) {
-    await enrichPvpRisk(eligible);
-    if (config.screening.blockPvpSymbols) {
-      const before = eligible.length;
-      const pvpRemoved = eligible.filter((p) => p.is_pvp);
-      pvpRemoved.forEach((p) => pushFilteredReason(filteredOut, p, "PVP hard filter"));
-      eligible.splice(0, eligible.length, ...eligible.filter((p) => !p.is_pvp));
-      if (eligible.length < before) {
-        log("screening", `PVP hard filter removed ${before - eligible.length} pool(s)`);
-      }
+  // Price direction filter — requires REAL upward momentum before entry.
+  // bid_ask strategy needs 2 consecutive green candles, not a dead-cat bounce off a single up candle.
+  //
+  // PASS conditions (either qualifies):
+  //   (a) ALL candles are green (price in full uptrend across the window)
+  //   (b) Last 2 candles are both green (v[n-2] > v[n-3] AND v[n-1] > v[n-2])
+  //
+  // If fewer than 3 valid data points exist, we can't verify 2 consecutive candles → pass (no data).
+  eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+    const trend = p.price_trend;
+    if (!Array.isArray(trend) || trend.length < 3) return true; // no data → pass
+    const valid = trend.filter(v => v > 0); // strip -1.0 placeholder values
+    if (valid.length < 3) return true; // need at least 3 points to check 2 consecutive rises
+
+    const n = valid.length;
+
+    // (a) All consecutive candles rising
+    const allGreen = valid.every((v, i) => i === 0 || v > valid[i - 1]);
+
+    // (b) Last 2 candles both green: [n-3] → [n-2] up AND [n-2] → [n-1] up
+    const lastTwoGreen = valid[n - 1] > valid[n - 2] && valid[n - 2] > valid[n - 3];
+
+    if (!allGreen && !lastTwoGreen) {
+      const tail = valid.slice(-3).map(v => v.toExponential(2)).join(" → ");
+      log("screening", `Price direction filter: dropped ${p.name} — need 2 consecutive green candles or full uptrend (last 3: ${tail})`);
+      pushFilteredReason(filteredOut, p, "price direction: need 2 consecutive green candles (dead-cat bounce blocked)");
+      return false;
     }
-  }
+
+    return true;
+  }));
+
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
@@ -200,6 +280,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].dev_sold_all    = adv.dev_sold_all;
         eligible[i].dex_boost       = adv.dex_boost;
         eligible[i].dex_screener_paid = adv.dex_screener_paid;
+        eligible[i].fees_sol        = adv.total_fee_sol;   // lifetime fees in SOL — enforces minTokenFeesSol hard rule
         if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
       }
       if (risk) {
@@ -227,7 +308,37 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     }));
 
-    // ATH filter — drop pools where price is too close to ATH
+    // Bundle % hard filter — high bundle = coordinated launch = manipulation risk
+    const maxBundle = config.screening.maxBundlePct;
+    if (maxBundle != null) {
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.bundle_pct == null) return true; // no OKX data → pass
+        if (p.bundle_pct > maxBundle) {
+          log("screening", `Bundle filter: dropped ${p.name} — ${p.bundle_pct}% bundle > max ${maxBundle}%`);
+          pushFilteredReason(filteredOut, p, `${p.bundle_pct}% bundle above max ${maxBundle}%`);
+          return false;
+        }
+        return true;
+      }));
+    }
+
+    // Lifetime token fees filter — token must have generated enough real fees to prove legitimacy
+    const minFeesSol = config.screening.minTokenFeesSol;
+    if (minFeesSol != null) {
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.fees_sol == null) return true; // no OKX data → pass
+        if (p.fees_sol < minFeesSol) {
+          log("screening", `Token fees filter: dropped ${p.name} — ${p.fees_sol.toFixed(1)} SOL lifetime fees < min ${minFeesSol}`);
+          pushFilteredReason(filteredOut, p, `${p.fees_sol.toFixed(1)} SOL lifetime fees below min ${minFeesSol}`);
+          return false;
+        }
+        return true;
+      }));
+    }
+
+    // ATH filter — caps the UPPER end: drops pools where price is too close to (or above) ATH
+    // e.g. athFilterPct = -20 means price must be <= 80% of ATH (overbought / extended)
+    // This is separate from minAthPct which sets the LOWER floor (too far below ATH = dead)
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
       const threshold = 100 + athFilter; // e.g. -20 → threshold = 80 (price must be <= 80% of ATH)
@@ -244,6 +355,27 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
     }
 
+    // minAthPct filter — only applies to NEW tokens (< 5 days old)
+    // Old tokens are judged purely by fee/tvl, volume, and organic score — ATH is irrelevant
+    // for coins that pumped weeks/months ago; what matters is whether the pool is active now
+    const minAthPct = config.screening.minAthPct;
+    if (minAthPct != null) {
+      const NEW_TOKEN_MAX_HOURS = 5 * 24; // 5 days
+      const beforeAth = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        // Old token — skip ATH filter entirely, trust fee/tvl + volume
+        if (p.token_age_hours != null && p.token_age_hours >= NEW_TOKEN_MAX_HOURS) return true;
+        if (p.price_vs_ath_pct == null) return true; // no OKX data → don't filter
+        if (p.price_vs_ath_pct < minAthPct) {
+          log("screening", `minAthPct filter: dropped ${p.name} — ${p.price_vs_ath_pct}% of ATH (min: ${minAthPct}%, age: ${p.token_age_hours}h)`);
+          pushFilteredReason(filteredOut, p, `${p.price_vs_ath_pct}% of ATH below min ${minAthPct}% (new token, ${p.token_age_hours}h old)`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < beforeAth) log("screening", `minAthPct filter removed ${beforeAth - eligible.length} new token(s) below ATH threshold`);
+    }
+
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
     const before = eligible.length;
     const filtered = eligible.filter((p) => {
@@ -258,10 +390,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
   }
 
+  // Trim to final limit after all OKX filters — we held 3× headroom above to allow backfill
+  if (eligible.length > limit) eligible.splice(limit);
+  log("screening", `Final candidates after all filters: ${eligible.length}/${pools.length} screened`);
+
   return {
     candidates: eligible,
     total_screened: pools.length,
-    filtered_examples: filteredOut.slice(0, 3),
+    filtered_examples: filteredOut,
+    fetched_at: new Date().toISOString(),
   };
 }
 
@@ -319,9 +456,12 @@ function condensePool(p) {
     fee_window: round(p.fee),
     volume_window: round(p.volume),
     // API sometimes returns 0 for fee_active_tvl_ratio on short timeframes — compute from raw values as fallback
+    // NaN guard: only divide when both fee and active_tvl are non-null, non-zero numbers
     fee_active_tvl_ratio: p.fee_active_tvl_ratio > 0
       ? fix(p.fee_active_tvl_ratio, 4)
-      : (p.active_tvl > 0 ? fix((p.fee / p.active_tvl) * 100, 4) : 0),
+      : (p.fee != null && p.active_tvl != null && p.active_tvl > 0 && p.fee > 0
+          ? fix((p.fee / p.active_tvl) * 100, 4)
+          : 0),
     volatility: fix(p.volatility, 2),
 
 
@@ -329,7 +469,7 @@ function condensePool(p) {
     holders: p.base_token_holders,
     mcap: round(p.token_x?.market_cap),
     organic_score: Math.round(p.token_x?.organic_score || 0),
-    token_age_hours: p.token_x?.created_at
+    token_age_hours: (p.token_x?.created_at && Number.isFinite(p.token_x.created_at))
       ? Math.floor((Date.now() - p.token_x.created_at) / 3_600_000)
       : null,
     dev: p.token_x?.dev || null,

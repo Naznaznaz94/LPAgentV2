@@ -12,9 +12,10 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, updateSignalSnapshot } from "../state.js";
+import { getAndClearStagedSignals } from "../signal-tracker.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -61,7 +62,9 @@ const toolMap = {
   study_top_lpers: studyTopLPers,
   set_position_note: ({ position_address, instruction }) => {
     const ok = setPositionInstruction(position_address, instruction || null);
-    if (!ok) return { error: `Position ${position_address} not found in state` };
+    // setPositionInstruction returns: true (saved), false (not found), or { error: string } (rejected)
+    if (ok === false) return { error: `Position ${position_address} not found in state` };
+    if (ok && typeof ok === "object" && ok.error) return { error: ok.error };
     return { saved: true, position: position_address, instruction: instruction || null };
   },
   self_update: async () => {
@@ -130,6 +133,7 @@ const toolMap = {
     const CONFIG_MAP = {
       // screening
       minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
+      maxFeeActiveTvlRatio: ["screening", "maxFeeActiveTvlRatio"],
       minTvl: ["screening", "minTvl"],
       maxTvl: ["screening", "maxTvl"],
       minVolume: ["screening", "minVolume"],
@@ -148,7 +152,17 @@ const toolMap = {
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
-      minFeePerTvl24h: ["management", "minFeePerTvl24h"],
+      minAthPct:        ["screening", "minAthPct"],
+      minFeePct:        ["screening", "minFeePct"],
+      blockedLaunchpads:    ["screening", "blockedLaunchpads"],
+      avoidPvpSymbols:      ["screening", "avoidPvpSymbols"],
+      blockPvpSymbols:      ["screening", "blockPvpSymbols"],
+      minFeePerTvl24h:      ["management", "minFeePerTvl24h"],
+      pnlSanityMaxDiffPct:    ["management", "pnlSanityMaxDiffPct"],
+      minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
+      poolMaxDeploys:         ["management", "poolMaxDeploys"],
+      poolDeployWindowDays:   ["management", "poolDeployWindowDays"],
+      poolCooldownHours:      ["management", "poolCooldownHours"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -171,13 +185,18 @@ const toolMap = {
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
       // schedule
-      managementIntervalMin: ["schedule", "managementIntervalMin"],
-      screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+      managementIntervalMin:  ["schedule", "managementIntervalMin"],
+      screeningIntervalMin:   ["schedule", "screeningIntervalMin"],
+      healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
       // models
       managementModel: ["llm", "managementModel"],
-      screeningModel: ["llm", "screeningModel"],
-      generalModel: ["llm", "generalModel"],
+      screeningModel:  ["llm", "screeningModel"],
+      generalModel:    ["llm", "generalModel"],
+      temperature:     ["llm", "temperature"],
+      maxTokens:       ["llm", "maxTokens"],
+      maxSteps:        ["llm", "maxSteps"],
       // strategy
+      strategy:  ["strategy", "strategy"],
       binsBelow: ["strategy", "binsBelow"],
     };
 
@@ -300,12 +319,17 @@ export async function executeTool(name, args) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        // Attach staged Darwin signals to the new position
+        if (result.position && args.pool_address) {
+          const signals = getAndClearStagedSignals(args.pool_address);
+          if (signals) updateSignalSnapshot(result.position, signals);
+        }
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
-          if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
+          if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` });
         }
         // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
@@ -367,7 +391,9 @@ async function runSafetyChecks(name, args) {
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+      if (args.bin_step == null) {
+        log("safety_warn", `deploy_position called without bin_step — SDK will pick pool default which may not match config range [${minStep}-${maxStep}]. Always pass bin_step explicitly.`);
+      } else if (args.bin_step < minStep || args.bin_step > maxStep) {
         return {
           pass: false,
           reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
@@ -403,6 +429,20 @@ async function runSafetyChecks(name, args) {
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
           };
         }
+      }
+
+      // Cooldown check — block re-entry into pools/tokens that are on cooldown
+      if (isPoolOnCooldown(args.pool_address)) {
+        return {
+          pass: false,
+          reason: `Pool ${args.pool_address} is on cooldown — re-entry blocked. Wait for cooldown to expire.`,
+        };
+      }
+      if (args.base_mint && isBaseMintOnCooldown(args.base_mint)) {
+        return {
+          pass: false,
+          reason: `Base token ${args.base_mint} is on cooldown — re-entry blocked. Wait for cooldown to expire.`,
+        };
       }
 
       // Check amount limits

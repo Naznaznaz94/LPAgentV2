@@ -1,9 +1,20 @@
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
 
-const STATE_FILE = "./state.json";
-const LESSONS_FILE = "./lessons.json";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STATE_FILE = path.join(__dirname, "state.json");
+const LESSONS_FILE = path.join(__dirname, "lessons.json");
+
+/** Escape special HTML characters so Telegram's HTML parser doesn't choke */
+function escHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 export async function generateBriefing() {
   const state = loadJson(STATE_FILE) || { positions: {}, recentEvents: [] };
@@ -46,12 +57,12 @@ export async function generateBriefing() {
     "",
     `<b>Lessons Learned:</b>`,
     lessonsLast24h.length > 0
-      ? lessonsLast24h.map(l => `• ${l.rule}`).join("\n")
+      ? lessonsLast24h.map(l => `• ${escHtml(l.rule)}`).join("\n")
       : "• No new lessons recorded overnight.",
     "",
     `<b>Current Portfolio:</b>`,
     `📂 Open Positions: ${openPositions.length}`,
-    perfSummary
+    perfSummary && Number.isFinite(perfSummary.total_pnl_usd)
       ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
       : "",
     "────────────────"

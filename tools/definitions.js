@@ -372,12 +372,12 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitFeePct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Screening: minFeeActiveTvlRatio, maxFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, maxBundlePct, maxBotHoldersPct, maxTop10Pct, minFeePct, blockedLaunchpads, minTokenAgeHours, maxTokenAgeHours, athFilterPct, minAthPct
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, stopLossPct, takeProfitFeePct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct, minFeePerTvl24h, minAgeBeforeYieldCheck, autoSwapAfterClaim, trailingTakeProfit, trailingTriggerPct, trailingDropPct, pnlSanityMaxDiffPct, solMode, poolMaxDeploys, poolDeployWindowDays, poolCooldownHours
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
-Strategy: binsBelow
+Strategy: binsBelow, strategy
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {

@@ -103,6 +103,7 @@ export async function deployPosition({
   pool_name,
   bin_step,
   base_fee,
+  base_mint,  // agent-supplied base token mint (authoritative on-chain value used as fallback below)
   volatility,
   fee_tvl_ratio,
   organic_score,
@@ -246,6 +247,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      base_mint: base_mint || baseMint, // prefer agent-supplied, fall back to on-chain authoritative value
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
@@ -259,7 +261,8 @@ export async function deployPosition({
     });
 
     const actualBinStep = pool.lbPair.binStep;
-    const activePrice = parseFloat(activeBin.price);
+    // activeBin.price is a BN (lamport-scaled) — convert to human-readable float first
+    const activePrice = pool.fromPricePerLamport(Number(activeBin.price));
     const minPrice = activePrice * Math.pow(1 + actualBinStep / 10000, minBinId - activeBin.binId);
     const maxPrice = activePrice * Math.pow(1 + actualBinStep / 10000, maxBinId - activeBin.binId);
 
@@ -452,8 +455,10 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
     // Fetch bin data (lowerBinId, upperBinId, poolActiveBinId) for all pools in parallel
     // Needed for rules 3 & 4 (active_bin vs upper_bin comparison)
     const binDataByPool = {};
-    const pnlMaps = await Promise.all(pools.map(pool => fetchDlmmPnlForPool(pool.poolAddress, walletAddress)));
-    pools.forEach((pool, i) => { binDataByPool[pool.poolAddress] = pnlMaps[i]; });
+    const pnlMaps = await Promise.allSettled(pools.map(pool => fetchDlmmPnlForPool(pool.poolAddress, walletAddress)));
+    pools.forEach((pool, i) => {
+      if (pnlMaps[i].status === "fulfilled") binDataByPool[pool.poolAddress] = pnlMaps[i].value;
+    });
     const lpAgentByPosition = await fetchLpAgentOpenPositions(walletAddress);
 
     const positions = [];
@@ -478,10 +483,12 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
         const ageFromState = tracked?.deployed_at
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
           : null;
+        // Use safeNum instead of parseFloat to prevent NaN from non-numeric API responses
+        // (e.g. "N/A" strings) — NaN propagating to pnl_pct would silently disable stop-loss
         const reportedPnlPct = lpData
-          ? parseFloat(config.management.solMode ? (lpData.pnl?.percentNative || 0) : (lpData.pnl?.percent || 0))
+          ? safeNum(config.management.solMode ? (lpData.pnl?.percentNative ?? 0) : (lpData.pnl?.percent ?? 0))
           : binData
-            ? parseFloat(config.management.solMode ? (binData.pnlSolPctChange || 0) : (binData.pnlPctChange || 0))
+            ? safeNum(config.management.solMode ? (binData.pnlSolPctChange ?? 0) : (binData.pnlPctChange ?? 0))
             : null;
         const derivedPnlPct = lpData
           ? deriveLpAgentPnlPct(lpData, config.management.solMode)
@@ -621,9 +628,11 @@ export async function getWalletPositions({ wallet_address }) {
 
     // Enrich with PnL API
     const uniquePools = [...new Set(raw.map((r) => r.pool))];
-    const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
+    const pnlMaps = await Promise.allSettled(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
-    uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    uniquePools.forEach((pool, i) => {
+      if (pnlMaps[i].status === "fulfilled") pnlByPool[pool] = pnlMaps[i].value;
+    });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
@@ -700,7 +709,7 @@ export async function claimFees({ position_address }) {
     });
 
     if (!txs || txs.length === 0) {
-      return { success: false, error: "No fees to claim — transaction is empty" };
+      return { success: false, error: "No fees to claim — claim transaction list is empty (position may have no unclaimed fees or already been claimed)" };
     }
 
     const txHashes = [];
@@ -710,7 +719,15 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    // Attempt to capture claimed fee amount from position data for performance tracking
+    let claimedFeesUsd = 0;
+    try {
+      const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
+      claimedFeesUsd = cachedPos
+        ? ((cachedPos.unclaimed_fees_true_usd ?? cachedPos.unclaimed_fees_usd ?? 0))
+        : 0;
+    } catch { /* best-effort */ }
+    recordClaim(position_address, claimedFeesUsd);
 
     return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
@@ -830,9 +847,13 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // Txs were sent on-chain — record the close in state even if verification timed out
+      // (RPC lag is the most common cause; the position is almost certainly gone on-chain)
+      log("close_warn", `Close verification timed out for ${position_address} — recording close anyway (txs confirmed on-chain)`);
+      recordClose(position_address, (reason || "agent decision") + " [verify-timeout]");
       return {
         success: false,
-        error: "Close transactions sent but position still appears open after verification window",
+        error: "Close transactions sent but position still appears open after verification window (recorded as closed in state)",
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
@@ -888,35 +909,48 @@ export async function closePosition({ position_address, reason }) {
           feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
           initialUsd    = tracked.initial_value_usd || 0;
           if (initialUsd > 0) {
-            // Keep fallback internally consistent using USD-only cached metrics.
-            finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
+            // PnL already includes fees — do NOT subtract feesUsd again (double-counting)
+            finalValueUsd = Math.max(0, initialUsd + pnlUsd);
             pnlPct = (pnlUsd / initialUsd) * 100;
           } else {
             finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;
-            initialUsd = Math.max(0, finalValueUsd + feesUsd - pnlUsd);
+            // Prefer tracked.initial_value_usd (recorded at deploy time) — the derived formula
+            // (finalValueUsd + feesUsd - pnlUsd) can underflow to 0 when API data is inconsistent,
+            // which would cause pnl_pct to be 0 or Infinity and poison the lessons system.
+            initialUsd = (tracked.initial_value_usd > 0)
+              ? tracked.initial_value_usd
+              : Math.max(0, finalValueUsd + feesUsd - pnlUsd);
           }
           log("close_warn", `Using cached pnl fallback because closed API has not settled yet`);
         }
       }
 
-      await recordPerformance({
-        position: position_address,
-        pool: poolAddress,
-        pool_name: tracked.pool_name || poolAddress.slice(0, 8),
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility || null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
-        fees_earned_usd: feesUsd,
-        final_value_usd: finalValueUsd,
-        initial_value_usd: initialUsd,
-        minutes_in_range: minutesHeld - minutesOOR,
-        minutes_held: minutesHeld,
-        close_reason: reason || "agent decision",
-      });
+      // Guard: if both initialUsd and finalValueUsd are 0, data fetch failed — skip recording
+      // to avoid writing a zero-value performance record that would poison the lessons system
+      if (initialUsd === 0 && finalValueUsd === 0) {
+        log("close_warn", `Skipping recordPerformance for ${position_address} — both initialUsd and finalValueUsd are 0 (data unavailable). Position closed successfully but no performance record written.`);
+      } else {
+        await recordPerformance({
+          position: position_address,
+          pool: poolAddress,
+          pool_name: tracked.pool_name || poolAddress.slice(0, 8),
+          strategy: tracked.strategy,
+          bin_range: tracked.bin_range,
+          bin_step: tracked.bin_step || null,
+          volatility: tracked.volatility || null,
+          fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+          organic_score: tracked.organic_score || null,
+          amount_sol: tracked.amount_sol,
+          fees_earned_usd: feesUsd,
+          final_value_usd: finalValueUsd,
+          initial_value_usd: initialUsd,
+          minutes_in_range: minutesHeld - minutesOOR,
+          minutes_held: minutesHeld,
+          close_reason: reason || "agent decision",
+          deployed_at: tracked.deployed_at || null,
+          base_mint: pool.lbPair?.tokenXMint?.toString() || null,
+        });
+      }
 
       return {
         success: true,
@@ -944,6 +978,26 @@ export async function closePosition({ position_address, reason }) {
     };
   } catch (error) {
     log("close_error", error.message);
+
+    // AccountOwnedByWrongProgram (0xbbf / error 3007) means the position account
+    // is owned by System Program — it no longer exists on-chain (already closed or
+    // never deployed). Auto-purge from state so it stops blocking management cycles.
+    const isGone =
+      error.message?.includes("AccountOwnedByWrongProgram") ||
+      error.message?.includes("0xbbf") ||
+      error.message?.includes("3007") ||
+      error.message?.includes("could not find account");
+    if (isGone) {
+      log("close_warn", `Position ${position_address} no longer exists on-chain — purging from state`);
+      try { recordClose(position_address, "auto-purged: position not found on-chain"); } catch (_) {}
+      return {
+        success: true,
+        purged: true,
+        position: position_address,
+        message: "Position not found on-chain — purged from state registry",
+      };
+    }
+
     return { success: false, error: error.message };
   }
 }
