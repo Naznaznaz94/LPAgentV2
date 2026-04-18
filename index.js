@@ -323,12 +323,22 @@ export async function runManagementCycle({ silent = false } = {}) {
       const actionBlocks = actionPositions.map((p) => {
         const act = actionMap.get(p.position);
         const closeReason = act.reason || "close";
+        const tracked = getTrackedPosition(p.position);
+        // Build deploy-time context so LLM can compare then vs now
+        const deployContext = tracked ? [
+          tracked.fee_tvl_ratio    != null ? `fee_tvl=${tracked.fee_tvl_ratio}%`       : null,
+          tracked.organic_score    != null ? `organic=${tracked.organic_score}`         : null,
+          tracked.volatility       != null ? `volatility=${tracked.volatility}`         : null,
+          tracked.initial_value_usd != null ? `value=${cur}${tracked.initial_value_usd}` : null,
+          tracked.deployed_at      ? `age=${Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)}m` : null,
+        ].filter(Boolean).join(", ") : null;
         return [
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Exit alert: ${act.reason}` : ""}`,
           act.action === "CLOSE" ? `  ⚠️ USE THIS EXACT reason string → "${closeReason}"${act.rule === "exit" ? " (exit alert — trailing TP or stop loss confirmed)" : ""}` : null,
-          `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+          `  now:    pnl_pct=${p.pnl_pct}% | fees=${cur}${p.unclaimed_fees_usd} | value=${cur}${p.total_value_usd} | fee_per_tvl_24h=${p.fee_per_tvl_24h ?? "?"}%`,
+          deployContext ? `  entry:  ${deployContext}` : null,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
         ].filter(Boolean).join("\n");

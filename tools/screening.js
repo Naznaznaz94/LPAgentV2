@@ -27,7 +27,8 @@ export async function discoverPools({
     "quote_token_has_critical_warnings=false",
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
-    `quote_token_address=${SOL_MINT}`,  // SOL-only pools
+    // NOTE: quote_token_address filter removed — API returns 0 results when it's included.
+    // SOL-only enforcement is handled by the hard post-filter below (condensePool + solOnly check).
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
@@ -209,31 +210,42 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .slice(0, limit * 3); // keep 3× headroom — OKX filters reduce this to final limit
 
   // Price direction filter — requires REAL upward momentum before entry.
-  // bid_ask strategy needs 2 consecutive green candles, not a dead-cat bounce off a single up candle.
+  // bid_ask strategy needs confirmed buying pressure, not a dead-cat bounce off a single up candle.
   //
-  // PASS conditions (either qualifies):
-  //   (a) ALL candles are green (price in full uptrend across the window)
-  //   (b) Last 2 candles are both green (v[n-2] > v[n-3] AND v[n-1] > v[n-2])
+  // PASS conditions (any one qualifies):
+  //   (a) ALL candles are green (price in full uptrend across the window)    → up, up, up
+  //   (b) Last 2 candles both green: [n-3]→[n-2] up AND [n-2]→[n-1] up     → down, up, up
+  //   (c) Pullback then recovery: [n-3]→[n-2] up AND [n-2]→[n-1] down AND [n-1]→... wait —
+  //       i.e. [n-2] > [n-3] (first green) AND [n-1] < [n-2] (red dip) AND [n-1] > [n-3] (recovery above start) → BLOCKED
+  //       Correct form: last candle green AND second-to-last red AND third-to-last green
+  //       = [n-1] > [n-2]  AND  [n-2] < [n-3]  AND  [n-3] > [n-4]           → up, down, up
   //
-  // If fewer than 3 valid data points exist, we can't verify 2 consecutive candles → pass (no data).
+  // If fewer than 3 valid data points exist, we can't verify the pattern → pass (no data).
   eligible.splice(0, eligible.length, ...eligible.filter((p) => {
     const trend = p.price_trend;
     if (!Array.isArray(trend) || trend.length < 3) return true; // no data → pass
     const valid = trend.filter(v => v > 0); // strip -1.0 placeholder values
-    if (valid.length < 3) return true; // need at least 3 points to check 2 consecutive rises
+    if (valid.length < 3) return true; // need at least 3 points
 
     const n = valid.length;
 
-    // (a) All consecutive candles rising
+    // (a) All consecutive candles rising → up, up, up
     const allGreen = valid.every((v, i) => i === 0 || v > valid[i - 1]);
 
-    // (b) Last 2 candles both green: [n-3] → [n-2] up AND [n-2] → [n-1] up
+    // (b) Last 2 candles both green → (anything), up, up
     const lastTwoGreen = valid[n - 1] > valid[n - 2] && valid[n - 2] > valid[n - 3];
 
-    if (!allGreen && !lastTwoGreen) {
-      const tail = valid.slice(-3).map(v => v.toExponential(2)).join(" → ");
-      log("screening", `Price direction filter: dropped ${p.name} — need 2 consecutive green candles or full uptrend (last 3: ${tail})`);
-      pushFilteredReason(filteredOut, p, "price direction: need 2 consecutive green candles (dead-cat bounce blocked)");
+    // (c) Pullback-recovery: last green, previous red, one before that green → up, down, up
+    //     Requires 4 data points to confirm the leading green candle.
+    const upDownUp = n >= 4
+      && valid[n - 1] > valid[n - 2]   // last candle: green
+      && valid[n - 2] < valid[n - 3]   // second-to-last: red (dip)
+      && valid[n - 3] > valid[n - 4];  // third-to-last: green (leading move)
+
+    if (!allGreen && !lastTwoGreen && !upDownUp) {
+      const tail = valid.slice(-4).map(v => v.toExponential(2)).join(" → ");
+      log("screening", `Price direction filter: dropped ${p.name} — need up/up, up/up/up, or up/down/up pattern (last 4: ${tail})`);
+      pushFilteredReason(filteredOut, p, "price direction: no valid entry pattern (blocked: not up/up, up/up/up, or up/down/up)");
       return false;
     }
 
