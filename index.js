@@ -55,8 +55,9 @@ function buildPrompt() {
 //  CRON DEFINITIONS
 // ═══════════════════════════════════════════
 let _cronTasks = [];
-let _managementBusy = false; // prevents overlapping management cycles
-let _screeningBusy = false;  // prevents overlapping screening cycles
+let _managementBusy = false;   // prevents overlapping management cycles
+let _screeningBusy = false;    // prevents overlapping screening cycles
+let _healthCheckBusy = false;  // prevents health check from sharing _managementBusy flag
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
 const _peakConfirmTimers = new Map();
@@ -167,7 +168,7 @@ function stopCronJobs() {
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
-  if (_managementBusy) return null;
+  if (_managementBusy || _healthCheckBusy) return null;
   _managementBusy = true;
   timers.managementLastRun = Date.now();
   log("cron", "Starting management cycle");
@@ -669,7 +670,7 @@ export function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
+    if (_managementBusy || _healthCheckBusy) return;
     timers.managementLastRun = Date.now();
     await runManagementCycle();
   });
@@ -677,8 +678,8 @@ export function startCronJobs() {
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
+    if (_managementBusy || _healthCheckBusy) return;
+    _healthCheckBusy = true;
     timers.managementLastRun = Date.now(); // update countdown so UI stays accurate during health check
     log("cron", "Starting health check");
     try {
@@ -690,7 +691,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
-      _managementBusy = false;
+      _healthCheckBusy = false;
     }
   });
 

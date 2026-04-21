@@ -82,7 +82,7 @@ export async function recordPerformance(perf) {
     perf.initial_value_usd >= 20 &&
     perf.amount_sol >= 0.25 &&
     perf.final_value_usd > 0 &&
-    perf.final_value_usd <= perf.amount_sol * 2;
+    perf.final_value_usd < perf.amount_sol;
 
   if (suspiciousUnitMix) {
     log("lessons_warn", `Skipped suspicious performance record for ${perf.pool_name || perf.pool}: initial=${perf.initial_value_usd}, final=${perf.final_value_usd}, amount_sol=${perf.amount_sol}`);
@@ -228,19 +228,22 @@ function derivLesson(perf) {
 
   let rule = "";
 
-  if (outcome === "good" || outcome === "bad" || outcome === "neutral") {
-    if (perf.range_efficiency < 30 && outcome === "bad") {
+  if (outcome === "good" || outcome === "bad" || outcome === "neutral" || outcome === "poor") {
+    if (perf.range_efficiency < 30 && (outcome === "bad" || outcome === "poor")) {
       rule = `AVOID: ${safePoolName}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && (outcome === "good" || outcome === "neutral")) {
       rule = `PREFER: ${safePoolName}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
       tags.push("efficient", perf.strategy);
-    } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
+    } else if ((outcome === "bad" || outcome === "poor") && perf.close_reason?.includes("volume")) {
       rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
       tags.push("volume_collapse");
     } else if (outcome === "good") {
       rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
       tags.push("worked");
+    } else if (outcome === "poor") {
+      rule = `UNDERPERFORMED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
+      tags.push("failed");
     } else if (outcome === "bad") {
       rule = `FAILED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
       tags.push("failed");

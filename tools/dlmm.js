@@ -612,10 +612,21 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
 export async function getWalletPositions({ wallet_address }) {
   try {
     const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+    const ownerBase58 = new PublicKey(wallet_address).toBase58();
 
-    const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
-      filters: [{ memcmp: { offset: 40, bytes: new PublicKey(wallet_address).toBase58() } }],
+    // offset 40 = 8 (discriminator) + 32 (lb_pair pubkey) → owner field in Position v1
+    let accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
+      filters: [{ memcmp: { offset: 40, bytes: ownerBase58 } }],
     });
+
+    // Fallback: offset 72 = 8 (discriminator) + 32 (lb_pair) + 32 (nft_mint) → owner in some Position2 layouts
+    if (accounts.length === 0) {
+      log("wallet_positions", `No accounts at offset 40 for ${wallet_address.slice(0, 8)} — trying offset 72 (Position2 fallback)`);
+      const accounts72 = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
+        filters: [{ memcmp: { offset: 72, bytes: ownerBase58 } }],
+      });
+      accounts = accounts72;
+    }
 
     if (accounts.length === 0) {
       return { wallet: wallet_address, total_positions: 0, positions: [] };

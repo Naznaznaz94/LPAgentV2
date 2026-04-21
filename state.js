@@ -352,7 +352,7 @@ export function resolvePendingTrailingDrop(position_address, currentPnlPct, trai
   if (stillNearCrash && stillDroppedEnough) {
     const reason = `Trailing TP: peak ${pendingPeak.toFixed(2)}% → current ${currentPnlPct.toFixed(2)}% (dropped ${(pendingPeak - currentPnlPct).toFixed(2)}% >= ${trailingDropPct}%)`;
     pos.confirmed_trailing_exit_reason = reason;
-    pos.confirmed_trailing_exit_until = new Date(Date.now() + 90_000).toISOString(); // 90s window — safely > 30s poll interval
+    pos.confirmed_trailing_exit_until = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min window — resilient to poller/management delay under load
     save(state);
     log("state", `Position ${position_address} trailing drop confirmed after recheck: pending drop ${pendingDrop.toFixed(2)}%, current ${currentPnlPct.toFixed(2)}%`);
     return { confirmed: true, reason };
@@ -554,6 +554,15 @@ const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min
 
 export function syncOpenPositions(active_addresses) {
   const state = load();
+
+  // Guard: if the live list is empty but we have tracked open positions, the portfolio
+  // API likely failed — skip auto-close entirely rather than marking all positions closed.
+  const trackedOpen = Object.values(state.positions).filter((p) => !p.closed);
+  if (active_addresses.length === 0 && trackedOpen.length > 0) {
+    log("state_warn", "syncOpenPositions: received 0 live addresses but have tracked positions — skipping auto-close (possible API failure)");
+    return;
+  }
+
   const activeSet = new Set(active_addresses);
   let changed = false;
 

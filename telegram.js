@@ -328,9 +328,27 @@ async function poll(onMessage) {
   }
 }
 
-export function startPolling(onMessage) {
+export async function startPolling(onMessage) {
   if (!TOKEN) return;
   _polling = true;
+
+  // Drain any stale pending updates before starting normal polling.
+  // Without this, restarting the agent replays messages from the last 24h
+  // (Telegram keeps unacknowledged updates), causing duplicate LLM calls.
+  try {
+    const drain = await fetch(`${BASE}/getUpdates?timeout=0&limit=100`);
+    if (drain.ok) {
+      const data = await drain.json();
+      const updates = data.result || [];
+      if (updates.length > 0) {
+        _offset = updates[updates.length - 1].update_id + 1;
+        log("telegram", `Drained ${updates.length} stale update(s) on startup — offset set to ${_offset}`);
+      }
+    }
+  } catch (e) {
+    log("telegram_warn", `Failed to drain stale updates on startup: ${e.message}`);
+  }
+
   poll(onMessage); // fire-and-forget
   log("telegram", "Bot polling started");
 }
