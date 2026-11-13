@@ -128,7 +128,7 @@ Only call this if you need the current price to calculate a specific bin range (
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
+2. No user spec → use the configured shape; the range is sized by the executor, not by you
 
 HARD RULES:
 - Never use 'curve'.
@@ -166,7 +166,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. Leave it out in the autonomous cycles: the executor sizes the range itself and ignores this value there. Pass it only when the owner asks for a specific range in this chat. For a % range (e.g. '-60% range') convert with bins = ceil(log(1 / (1 - pct)) / log(1 + bin_step/10000)). Example: -60% at bin_step 100 → ceil(log(2.5)/log(1.01)) = 93 bins. Capped at maxBinsBelow."
+            description: "Leave it out. The executor sizes the range itself (bottom coverMinPct–coverMaxPct below the entry price) and ignores this value in the autonomous cycles and in chat. If the owner asks for a different range in chat, tell him the two ways to get it: change coverMinPct / coverMaxPct with update_config and then deploy, or deploy from the CLI with --bins-below. For reference, a % range converts as bins = ceil(log(1 / (1 - pct)) / log(1 + bin_step/10000)); -60% at bin_step 100 = 93 bins."
           },
           bins_above: {
             type: "number",

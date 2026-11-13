@@ -45,17 +45,19 @@ export async function getPoolCandles(pool, timeframe, hours) {
 export async function getDipFacts(pool, { lookbackHours = 24, band = null } = {}) {
   const hourly = await getPoolCandles(pool, "1h", 72);
   const coarse = dipFromCandles({ hourly, lookbackHours });
-  if (!coarse) return null;
-  if (band && (coarse.dipPct < band.min - 3 || coarse.dipPct > band.max + 3)) {
+  if (coarse && band && (coarse.dipPct < band.min - 3 || coarse.dipPct > band.max + 3)) {
     return { ...coarse, source: "meteora" }; // far outside the band: the 5m detail would not change the answer
   }
+  // Also reached when the 1h candles are too few to say anything (a pool only a few hours old): the 5m candles
+  // of the last 3 hours can still carry the check, instead of handing a new pool to the weaker OKX fallback.
   let fine = [];
   try {
     fine = await getPoolCandles(pool, "5m", 3);
   } catch (e) {
     log("meteora", `5m candles unavailable for ${pool.slice(0, 8)}: ${e.message} — using the 1h candles only`);
   }
-  return { ...(dipFromCandles({ hourly, fine, lookbackHours }) ?? coarse), source: "meteora" };
+  const facts = dipFromCandles({ hourly, fine, lookbackHours }) ?? coarse;
+  return facts ? { ...facts, source: "meteora" } : null;
 }
 
 /** The pool record, reduced to what a deploy needs. Throws when the pool is unknown or the API is down. */

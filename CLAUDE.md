@@ -169,15 +169,20 @@ bins_below = ceil( ln(1 / (1 - cover/100)) / ln(1 + bin_step/10000) ), capped at
 
 -60% at bin step 100 = 93 bins, -70% = 121, -70% at bin step 80 = 152. Anything above 69 bins goes through the
 wide-range path in `dlmm.js` (`createExtendedEmptyPosition` + `addLiquidityByStrategyChunkable`).
-The model's `bins_below` is ignored in the autonomous cycles; a range the owner types (CLI `--bins-below`, or a
-Telegram chat request) is kept. `rangeMode: "bins"` is the old `round(35 + (volatility / 5) * 34)` clamp.
+A `bins_below` that comes through the model is ignored, in the autonomous cycles and in chat alike; only a range
+the owner types at the CLI (`--bins-below`) is kept. A hand-named pool gets its bin step and market cap from
+`getPoolFacts` and, with no volatility figure, `coverMaxPct`. `rangeMode: "bins"` is the old
+`round(35 + (volatility / 5) * 34)` clamp.
 
 **Exit — `checkBounceExit`**, called from `state.js updatePnlAndCheckExits` (30s poller and management cycle).
 `state.json` keeps `low_bin`, the lowest active bin seen since the open. depth = (top bin − low bin) / range
 width; bounce = `(1 + bin_step/10000)^(active − low) − 1`. depth ≥ `bounceExitMinDepthPct` and bounce ≥
 `bounceExitPct` (or `bounceExitDeepPct` once depth ≥ 75%) → `BOUNCE_EXIT`. Order of the exits: stop loss, bounce
-exit, trailing TP, out of range (`outOfRangeAboveWaitMinutes` above the range, `outOfRangeWaitMinutes` below),
-low yield.
+exit, trailing TP, out of range, low yield. Out-of-range waits: below the range `outOfRangeWaitMinutes` (30);
+above it `outOfRangeAboveWaitMinutes` (120), or `outOfRangeWaitMinutes` once price is more than
+`outOfRangeBinsToClose` bins above. More than `outOfRangeBinsToClose` bins BELOW the range still closes at once.
+`low_bin` only moves on two readings in a row, so one bad `active_bin` from the API cannot fake a deep dip.
+`takeProfitFeePct` is asked for by `setup.js` but no rule reads it: the only take-profit is the trailing one.
 
 ---
 

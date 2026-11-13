@@ -435,7 +435,8 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes out of range **below** before closing |
-| `outOfRangeAboveWaitMinutes` | `120` | Minutes out of range **above** (idle, all SOL) before closing |
+| `outOfRangeAboveWaitMinutes` | `120` | Minutes out of range **above** (idle, all SOL) before closing. Once price is more than `outOfRangeBinsToClose` (10) bins above, the shorter `outOfRangeWaitMinutes` applies |
+| `trailingTriggerPct` / `trailingDropPct` | `3` / `1.5` | Trailing take-profit: switches on at this PnL %, closes when PnL falls this many points from its peak. This is the only take-profit rule; `takeProfitFeePct` from the setup wizard is not read by any rule |
 | `bounceExit` | `true` | Leave on the bounce once price has been deep in the range |
 | `bounceExitMinDepthPct` | `50` | How far into the range the low must have gone |
 | `bounceExitPct` / `bounceExitDeepPct` | `10` / `6` | Bounce off the low that closes the position; the second applies past 75% of the range |

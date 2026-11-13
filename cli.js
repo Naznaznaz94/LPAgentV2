@@ -70,8 +70,9 @@ Output: { done: true, report: "..." }
 
 ### meridian deploy --pool <addr> --amount <sol> [--bins-below N] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
 Deploys a new LP position. All safety checks apply.
-Without --bins-below the range is sized in code: its bottom sits 60-70% below the entry price (coverMinPct / coverMaxPct),
-using the pool's bin step and market cap from Meteora. With --bins-below your number is used as typed.
+Without --bins-below the range is sized in code from the pool's bin step (read from Meteora): its bottom sits
+coverMaxPct (70%) below the entry price, the deep end, because a pool named by hand has no volatility figure.
+With --bins-below your number is used as typed (up to maxBinsBelow).
 \`\`\`
 Output: { success, position, pool_name, txs, price_range, bin_step, bins_below, cover_pct }
 \`\`\`

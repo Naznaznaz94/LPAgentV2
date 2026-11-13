@@ -136,7 +136,7 @@ export const CONFIG_BOUNDS = {
   entryMode:             { t: "enum", values: ["dip", "momentum"] },
   entryDipMinPct:        num(0, 90),
   entryDipMaxPct:        num(1, 95),
-  entryDipLookbackHours: num(1, 72),
+  entryDipLookbackHours: num(6, 72),   // under ~4 hourly candles there is nothing to measure a pullback on
   entrySettleMinutes:    num(0, 240),
   entrySettleBouncePct:  num(0, 50),
   entryMaxFall3dPct:     num(10, 100, { nullable: true }),
@@ -316,10 +316,15 @@ export function dipFromCandles({ hourly = [], fine = [], lookbackHours = 24, now
   let hi = win[0];
   for (const c of win) if (bodyTop(c) >= bodyTop(hi)) hi = c; // the latest candle at the high wins a tie
   const high = bodyTop(hi);
-  const after = win.filter((c) => c.t >= hi.t);
-  let lowC = after[0];
-  for (const c of after) if (bodyLow(c) <= bodyLow(lowC)) lowC = c; // the latest candle at the low wins a tie
-  const low = bodyLow(lowC);
+  // The low AFTER the high. It starts at the high candle's own CLOSE: that candle's open is a price from before
+  // the high (a candle that ran 50 → 100 would otherwise report 50 as "the low since the high", a huge fake
+  // bounce, and a falling chart would pass as settled). Then the bodies of every later candle.
+  let low = hi.close;
+  let lowC = hi;
+  for (const c of win) {
+    if (c.t <= hi.t) continue;
+    if (bodyLow(c) <= low) { low = bodyLow(c); lowC = c; } // the latest candle at the low wins a tie
+  }
   const high3d = Math.max(...all.map(bodyTop));
   const r1 = (x) => Math.round(x * 10) / 10;
   return {

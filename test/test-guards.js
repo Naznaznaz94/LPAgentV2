@@ -236,6 +236,33 @@ test("pullback facts from candles: body high, low after the high, bounce, time s
   assert.equal(dipFromCandles({ hourly: HOURLY, now: NOW + 4 * 3600 }), null);
 });
 
+test("pullback facts: the high candle's own open is not a low after the high", () => {
+  // one candle runs 50 -> 100, then price slides every hour and is still sliding now
+  const H = [
+    ...Array.from({ length: 10 }, (_, i) => hr(16 - i, 50, 50)),
+    hr(6, 50, 100),
+    hr(5, 99, 92), hr(4, 92, 86), hr(3, 86, 81), hr(2, 81, 78), hr(1, 78, 75),
+  ];
+  const f = dipFromCandles({ hourly: H, now: NOW });
+  assert.equal(f.high, 100);
+  assert.equal(f.low, 75);                 // not 50, the open of the candle that made the high
+  assert.equal(f.bouncePct, 0);
+  assert.equal(f.minsSinceLow, 0);
+  assert.equal(f.dipPct, 25);
+  assert.match(checkDipEntry(f, {}).reason, /new lows/);
+  // a red high candle (opens at the high, closes lower): its close does count
+  const R = [...Array.from({ length: 10 }, (_, i) => hr(14 - i, 60, 60)), hr(4, 100, 80), hr(3, 80, 78), hr(2, 78, 79), hr(1, 79, 79.5)];
+  const g = dipFromCandles({ hourly: R, now: NOW });
+  assert.equal(g.high, 100);
+  assert.equal(g.low, 78);
+  assert.equal(g.minsSinceLow, 60);
+  // a pool only a few hours old: no usable 1h history, the 5-minute candles carry the check
+  const young = Array.from({ length: 30 }, (_, i) => ({ timestamp: NOW - (150 - i * 5) * 60, open: i < 10 ? 10 + i : 20 - (i - 10) * 0.3, close: i < 10 ? 11 + i : 20 - (i - 9) * 0.3 }));
+  const y = dipFromCandles({ hourly: [], fine: young, now: NOW });
+  assert.equal(y.high, 20);
+  assert.ok(y.dipPct > 25 && y.dipPct < 35);
+});
+
 test("dip entry: only a settled 20-30% pullback passes", () => {
   const ok = { dipPct: 25, bouncePct: 4, minsSinceLow: 40, fall3dPct: 30 };
   assert.equal(checkDipEntry(ok, {}).pass, true);

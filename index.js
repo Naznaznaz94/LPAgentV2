@@ -208,8 +208,14 @@ async function retryPendingSwaps(openPositions = []) {
     }
     const name = item.pool_name || item.mint.slice(0, 8);
     const token = balances.tokens?.find((t) => t.mint === item.mint);
-    if (!token || !(token.balance > 0) || (token.usd != null && token.usd < 0.10)) {
-      clearPendingSwap(item.mint); // sold by hand, or only dust is left
+    if (token && token.balance > 0 && token.usd != null && token.usd < 0.10) {
+      clearPendingSwap(item.mint); // only dust is left
+      continue;
+    }
+    if (!token || !(token.balance > 0)) {
+      // Not in the wallet. Right after a close that can be the balance API lagging behind, so look three times
+      // before deciding there is nothing to sell (the position held no tokens, or they were sold by hand).
+      if (notePendingSwapAttempt(item.mint, "not in the wallet balance list") >= 3) clearPendingSwap(item.mint);
       continue;
     }
     let result;
@@ -335,9 +341,13 @@ export async function runManagementCycle({ silent = false } = {}) {
       if (!pnlSuspect && stopPnl != null && stopPnl <= config.management.stopLossPct) {
         return { action: "CLOSE", rule: 1, reason: "stop loss" };
       }
-      // Rule 2: pumped far above range
+      // Rule 2: pumped far above range. The position is all SOL up there: nothing is at risk, it is only idle.
+      // It used to be closed on the spot, which cut the "wait above the range" short at about +10%: a position
+      // opened on a bounce is often that far up within the hour. Now "far above" only shortens the wait, from
+      // outOfRangeAboveWaitMinutes to outOfRangeWaitMinutes.
       if (p.active_bin != null && p.upper_bin != null &&
-          p.active_bin > p.upper_bin + config.management.outOfRangeBinsToClose) {
+          p.active_bin > p.upper_bin + config.management.outOfRangeBinsToClose &&
+          (p.minutes_out_of_range ?? 0) >= config.management.outOfRangeWaitMinutes) {
         return { action: "CLOSE", rule: 2, reason: "pumped far above range" };
       }
       // Rule 3: pumped far below range (bid_ask — all bins below entry)

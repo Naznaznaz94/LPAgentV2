@@ -102,6 +102,7 @@ export function trackPosition({
     active_bin_at_deploy: active_bin,
     low_bin: active_bin ?? null,   // lowest active bin seen since the open (updatePnlAndCheckExits)
     low_bin_at: null,
+    low_bin_pending: null,         // a lower reading waiting for a second one to confirm it
     bin_step,
     volatility,
     fee_tvl_ratio,
@@ -488,10 +489,34 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   // Lowest price seen since the open, as a bin id. The bounce exit needs to know how deep price went.
-  if (Number.isFinite(active_bin) && (!Number.isFinite(pos.low_bin) || active_bin < pos.low_bin)) {
-    pos.low_bin = active_bin;
-    pos.low_bin_at = new Date().toISOString();
-    changed = true;
+  // The low only ever moves down, so one wrong reading from the API would stay for good and fake a deep dip.
+  // A reading inside or near the range is taken at once (a real low can last a single check). A reading more
+  // than a full range-width below the bottom is not believable on its own: it needs a second such reading in
+  // a row, and the less extreme of the two is kept.
+  if (Number.isFinite(active_bin)) {
+    const width = Number.isFinite(upper_bin) && Number.isFinite(lower_bin) ? upper_bin - lower_bin : null;
+    const plausible = width == null || width <= 0 || active_bin >= lower_bin - width;
+    if (!Number.isFinite(pos.low_bin)) {
+      if (plausible) {
+        pos.low_bin = active_bin;
+        changed = true;
+      }
+    } else if (active_bin < pos.low_bin) {
+      const confirmed = plausible
+        ? active_bin
+        : Number.isFinite(pos.low_bin_pending) ? Math.max(pos.low_bin_pending, active_bin) : null;
+      if (confirmed != null && confirmed < pos.low_bin) {
+        pos.low_bin = confirmed;
+        pos.low_bin_at = new Date().toISOString();
+        pos.low_bin_pending = null;
+      } else if (!plausible) {
+        pos.low_bin_pending = active_bin;
+      }
+      changed = true;
+    } else if (Number.isFinite(pos.low_bin_pending)) {
+      pos.low_bin_pending = null;
+      changed = true;
+    }
   }
 
   if (changed) save(state);
@@ -537,14 +562,16 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
     // Above the range the position is all SOL and only idle; below it, it holds the token. Different waits.
+    // Far above (more than outOfRangeBinsToClose bins) it is less likely to come back soon: the short wait again.
     const above = Number.isFinite(active_bin) && Number.isFinite(upper_bin) && active_bin > upper_bin;
-    const limit = above
+    const farAbove = above && active_bin > upper_bin + (mgmtConfig.outOfRangeBinsToClose ?? Infinity);
+    const limit = above && !farAbove
       ? (mgmtConfig.outOfRangeAboveWaitMinutes ?? mgmtConfig.outOfRangeWaitMinutes)
       : mgmtConfig.outOfRangeWaitMinutes;
     if (minutesOOR >= limit) {
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range ${above ? "above (idle)" : "below"} for ${minutesOOR}m (limit: ${limit}m)`,
+        reason: `Out of range ${farAbove ? "far above (idle)" : above ? "above (idle)" : "below"} for ${minutesOOR}m (limit: ${limit}m)`,
       };
     }
   }

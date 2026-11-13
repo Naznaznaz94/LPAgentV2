@@ -407,6 +407,10 @@ export async function executeTool(name, args, ctx = {}) {
               }
             } else if (balances.error) {
               swapFailed(`wallet balance could not be read (${balances.error})`);
+            } else if (!token || !(token.balance > 0)) {
+              // Not in the balance list. Either the position held no tokens, or the balance API has not caught
+              // up with the close yet. Do not assume the first: the management cycle looks again (3 times).
+              recordPendingSwap(result.base_mint, { pool_name: result.pool_name || null, error: "not in the wallet balance list right after the close" });
             }
           } catch (e) {
             swapFailed(e.message);
@@ -487,9 +491,11 @@ async function runSafetyChecks(name, args, ctx = {}) {
         openPositions: positions.unknown ? null : positions.positions,
         sizeCapSol: balance && !human ? computeDeployAmount(balance.sol) : null,
         requireScreened,
-        // A range the owner asked for himself (CLI, or a Telegram chat message) is kept as asked; in the
-        // autonomous cycles the range is always sized in code.
-        ownerRange: human || ctx.interactive === true,
+        // Only a range the owner typed himself at the CLI is kept as typed. Anything that reaches here through
+        // the model (the autonomous cycles, and chat too) is sized in code: a chat message is turned into
+        // arguments by the model, which could just as well invent a shallow range nobody asked for. To use a
+        // different range from chat, change coverMinPct / coverMaxPct with update_config first.
+        ownerRange: human,
       });
       if (!verdict.pass) return verdict;
       // Use the checked arguments from here on: bin step and base mint from the screening record, bins below
