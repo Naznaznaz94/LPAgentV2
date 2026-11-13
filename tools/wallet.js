@@ -8,6 +8,7 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { checkPriceImpact, quoteImpactPct } from "../guards.js";
 
 let _connection = null;
 let _wallet = null;
@@ -28,7 +29,10 @@ function getWallet() {
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
-const JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
+// The key used to be hard-coded here (and is still in this repo's git history: rotate it if it is yours).
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || "";
+const jupHeaders = (extra = {}) => (JUPITER_API_KEY ? { ...extra, "x-api-key": JUPITER_API_KEY } : extra);
+if (!JUPITER_API_KEY) log("wallet_warn", "JUPITER_API_KEY not set in .env — Jupiter requests go out without a key and may be rejected or rate-limited");
 
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
@@ -157,9 +161,7 @@ export async function swapToken({
       `&amount=${amountStr}` +
       `&taker=${wallet.publicKey.toString()}`;
 
-    const orderRes = await fetch(orderUrl, {
-      headers: { "x-api-key": JUPITER_API_KEY },
-    });
+    const orderRes = await fetch(orderUrl, { headers: jupHeaders() });
     if (!orderRes.ok) {
       const body = await orderRes.text();
       if (orderRes.status === 500) {
@@ -175,6 +177,15 @@ export async function swapToken({
       return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr });
     }
 
+    // Refuse a quote that moves the price too far (thin pool, dumped token). The tokens stay in the wallet.
+    const impact = checkPriceImpact(
+      quoteImpactPct({ inUsd: order.inUsdValue, outUsd: order.outUsdValue, reported: order.priceImpactPct ?? order.priceImpact }),
+      config.risk.maxSwapPriceImpactPct);
+    if (!impact.pass) {
+      log("swap_warn", `${input_mint}: ${impact.reason}`);
+      return { success: false, error: impact.reason, price_impact_blocked: true };
+    }
+
     const { transaction: unsignedTx, requestId } = order;
 
     // ─── Deserialize and sign ─────────────────────────────────
@@ -185,10 +196,7 @@ export async function swapToken({
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_ULTRA_API}/execute`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": JUPITER_API_KEY,
-      },
+      headers: jupHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
     });
     if (!execRes.ok) {
@@ -220,16 +228,23 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   // ─── Get quote ─────────────────────────────────────────────
   const quoteRes = await fetch(
     `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
-    { headers: { "x-api-key": JUPITER_API_KEY } }
+    { headers: jupHeaders() }
   );
   if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Quote error: ${quote.error}`);
+  const impact = checkPriceImpact(
+    quoteImpactPct({ inUsd: quote.inUsdValue, outUsd: quote.outUsdValue, reported: quote.priceImpactPct }),
+    config.risk.maxSwapPriceImpactPct);
+  if (!impact.pass) {
+    log("swap_warn", `${input_mint}: ${impact.reason}`);
+    return { success: false, error: impact.reason, price_impact_blocked: true };
+  }
 
   // ─── Get swap tx ───────────────────────────────────────────
   const swapRes = await fetch(`${JUPITER_QUOTE_API}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": JUPITER_API_KEY },
+    headers: jupHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toString(),
@@ -243,7 +258,11 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
   tx.sign([wallet]);
   const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-  await connection.confirmTransaction(txHash, "confirmed");
+  // confirmTransaction resolves even when the transaction failed on-chain: the error is in value.err
+  const confirmation = await connection.confirmTransaction(txHash, "confirmed");
+  if (confirmation?.value?.err) {
+    throw new Error(`Swap failed on-chain (fallback route): ${JSON.stringify(confirmation.value.err)} tx ${txHash}`);
+  }
 
   log("swap", `SUCCESS (fallback) tx: ${txHash}`);
   return { success: true, tx: txHash, input_mint, output_mint };

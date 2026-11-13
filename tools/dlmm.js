@@ -21,6 +21,13 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint } from "./wallet.js";
+import { sanitizeUntrusted } from "../guards.js";
+
+/** A close reason may come from the model: keep it one short line before it is stored and re-read into prompts. */
+function cleanReason(reason) {
+  const text = String(reason ?? "").replace(/[\u0000-\u001f\u007f`{}]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  return text || "agent decision";
+}
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -115,6 +122,11 @@ export async function deployPosition({
   const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
   const activeBinsAbove = bins_above ?? 0;
 
+  if (!config.risk.allowTwoSided && ((amount_x ?? 0) > 0 || activeBinsAbove > 0)) {
+    return { success: false, error: "SOL-only positions: amount_x and bins_above must be 0 (set allowTwoSided in user-config.json to permit two-sided deposits)." };
+  }
+  pool_name = sanitizeUntrusted(pool_name, 40);
+
   if (isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
     return { success: false, error: "Pool on cooldown — was recently closed with a cooldown reason. Try a different pool." };
@@ -144,6 +156,23 @@ export async function deployPosition({
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
+  }
+  // On-chain facts beat whatever the caller claimed.
+  const quoteMint = pool.lbPair.tokenYMint.toString();
+  if (quoteMint !== config.tokens.SOL) {
+    // amount_y is converted with 9 decimals below: on a USDC-quoted pool 0.5 would deposit 500 USDC.
+    return { success: false, error: `Pool ${pool_address} is not SOL-quoted (quote mint ${quoteMint.slice(0, 8)}…). Only TOKEN/SOL pools are supported.` };
+  }
+  const onChainBinStep = pool.lbPair.binStep;
+  if (onChainBinStep < config.screening.minBinStep || onChainBinStep > config.screening.maxBinStep) {
+    return { success: false, error: `Pool bin step ${onChainBinStep} is outside the allowed range [${config.screening.minBinStep}-${config.screening.maxBinStep}].` };
+  }
+  const mine = await getMyPositions();
+  if (mine.unknown) {
+    return { success: false, error: "Open positions could not be read (API error) — not deploying blind." };
+  }
+  if (mine.positions.some((p) => p.base_mint === baseMint)) {
+    return { success: false, error: `Already holding base token ${baseMint} in a position. One position per token only.` };
   }
   const activeBin = await pool.getActiveBin();
 
@@ -186,8 +215,8 @@ export async function deployPosition({
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
+  const txHashes = [];
   try {
-    const txHashes = [];
 
     if (isWideRange) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
@@ -247,7 +276,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
-      base_mint: base_mint || baseMint, // prefer agent-supplied, fall back to on-chain authoritative value
+      base_mint: baseMint, // on-chain value; the caller's claim is not trusted
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
@@ -287,6 +316,27 @@ export async function deployPosition({
     };
   } catch (error) {
     log("deploy_error", error.message);
+    if (txHashes.length > 0) {
+      // Some transactions landed before the failure (wide-range path: the position account exists, liquidity may
+      // be missing or partial). Track it so it is managed and can be closed, instead of leaving it orphaned.
+      _positionsCacheAt = 0;
+      try {
+        trackPosition({
+          position: newPosition.publicKey.toString(), pool: pool_address, pool_name, base_mint: baseMint,
+          strategy: activeStrategy,
+          bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
+          bin_step, volatility, fee_tvl_ratio, organic_score,
+          amount_sol: finalAmountY, amount_x: finalAmountX, active_bin: activeBin.binId, initial_value_usd,
+        });
+      } catch (e) {
+        log("deploy_error", `Could not track partial position: ${e.message}`);
+      }
+      return {
+        success: false, partial: true, error: error.message,
+        position: newPosition.publicKey.toString(), pool: pool_address, txs: txHashes,
+        note: "Deploy failed part-way: the position account was created. It is tracked — check it and close it to reclaim the rent.",
+      };
+    }
     return { success: false, error: error.message };
   }
 }
@@ -600,7 +650,9 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
     return result;
   } catch (error) {
     log("positions_error", `Portfolio fetch failed: ${error.stack || error.message}`);
-    return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message };
+    // unknown: true = the API failed. Callers must NOT read this as "no positions": that used to skip every
+    // stop loss and let screening open a new position on each cycle.
+    return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message, unknown: true };
   } finally {
     _positionsInflight = null;
   }
@@ -755,6 +807,7 @@ export async function closePosition({ position_address, reason }) {
   }
 
   const tracked = getTrackedPosition(position_address);
+  reason = cleanReason(reason);
 
   try {
     log("close", `Closing position: ${position_address}`);
@@ -845,6 +898,7 @@ export async function closePosition({ position_address, reason }) {
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
         const refreshed = await getMyPositions({ force: true, silent: true });
+        if (refreshed?.unknown) throw new Error(`positions API unavailable (${refreshed.error})`);
         const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
         if (!stillOpen) {
           closedConfirmed = true;
@@ -857,23 +911,15 @@ export async function closePosition({ position_address, reason }) {
       if (attempt < 3) await new Promise((r) => setTimeout(r, 3000));
     }
 
+    // The close transactions are confirmed on-chain at this point. If the portfolio API still lists the position
+    // (indexer lag) the close is still real, so carry on: record performance (which applies the cooldown) and
+    // report success (which swaps the leftover tokens). This used to return a failure and skip both.
     if (!closedConfirmed) {
-      // Txs were sent on-chain — record the close in state even if verification timed out
-      // (RPC lag is the most common cause; the position is almost certainly gone on-chain)
-      log("close_warn", `Close verification timed out for ${position_address} — recording close anyway (txs confirmed on-chain)`);
-      recordClose(position_address, (reason || "agent decision") + " [verify-timeout]");
-      return {
-        success: false,
-        error: "Close transactions sent but position still appears open after verification window (recorded as closed in state)",
-        position: position_address,
-        pool: poolAddress,
-        claim_txs: claimTxHashes,
-        close_txs: closeTxHashes,
-        txs: txHashes,
-      };
+      log("close_warn", `Close verification timed out for ${position_address} — txs are confirmed on-chain, continuing`);
     }
+    const verifyPending = !closedConfirmed;
 
-    recordClose(position_address, reason || "agent decision");
+    recordClose(position_address, reason);
 
     // Record performance for learning
     if (tracked) {
@@ -957,7 +1003,7 @@ export async function closePosition({ position_address, reason }) {
           initial_value_usd: initialUsd,
           minutes_in_range: minutesHeld - minutesOOR,
           minutes_held: minutesHeld,
-          close_reason: reason || "agent decision",
+          close_reason: reason,
           deployed_at: tracked.deployed_at || null,
           base_mint: pool.lbPair?.tokenXMint?.toString() || null,
         });
@@ -974,6 +1020,7 @@ export async function closePosition({ position_address, reason }) {
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
         base_mint: pool.lbPair.tokenXMint.toString(),
+        verify_pending: verifyPending,
       };
     }
 
@@ -986,6 +1033,7 @@ export async function closePosition({ position_address, reason }) {
       close_txs: closeTxHashes,
       txs: txHashes,
       base_mint: pool.lbPair.tokenXMint.toString(),
+      verify_pending: verifyPending,
     };
   } catch (error) {
     log("close_error", error.message);
@@ -993,11 +1041,8 @@ export async function closePosition({ position_address, reason }) {
     // AccountOwnedByWrongProgram (0xbbf / error 3007) means the position account
     // is owned by System Program — it no longer exists on-chain (already closed or
     // never deployed). Auto-purge from state so it stops blocking management cycles.
-    const isGone =
-      error.message?.includes("AccountOwnedByWrongProgram") ||
-      error.message?.includes("0xbbf") ||
-      error.message?.includes("3007") ||
-      error.message?.includes("could not find account");
+    const isGone = /AccountOwnedByWrongProgram|\b0xbbf\b|Error Number: 3007\b|custom program error: 0xbbf|could not find account/i
+      .test(error.message || "");
     if (isGone) {
       log("close_warn", `Position ${position_address} no longer exists on-chain — purging from state`);
       try { recordClose(position_address, "auto-purged: position not found on-chain"); } catch (_) {}

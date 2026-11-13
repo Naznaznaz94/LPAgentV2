@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { resolveDryRun } from "./guards.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -15,13 +16,22 @@ if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
-if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
+// Dry run is ON if either .env or user-config asks for it, and every other module reads the canonical
+// "true"/"false" written back here. (`DRY_RUN=false` from .env.example used to override `"dryRun": true`.)
+process.env.DRY_RUN = resolveDryRun(process.env.DRY_RUN, u.dryRun) ? "true" : "false";
 
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // SOL-only by default: a two-sided deposit starts half in the token. Set true to allow amount_x / bins_above
+    // on deploy and SOL -> token swaps.
+    allowTwoSided:         u.allowTwoSided         ?? false,
+    // Deploys are only allowed into pools from the latest screening run. Set true to deploy into any pool by hand.
+    allowUnscreenedDeploy: u.allowUnscreenedDeploy ?? false,
+    // A swap whose quoted price impact is above this is refused (the tokens stay in the wallet and you are told).
+    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 15,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -42,7 +52,9 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     maxBundlePct:      u.maxBundlePct      ?? 30,  // max bundle holding % (OKX advanced-info)
     maxBotHoldersPct:  u.maxBotHoldersPct  ?? 30,  // max bot holder addresses % (Jupiter audit)
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration (enforced in code since the audit)
+    requireRenouncedAuthorities: u.requireRenouncedAuthorities ?? true, // drop tokens whose mint or freeze authority is still live
+    failClosedOnMissingData:     u.failClosedOnMissingData     ?? true, // no safety data for a token = no entry
     blockedLaunchpads:  u.blockedLaunchpads  ?? [],  // e.g. ["letsbonk.fun", "pump.fun"]
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
@@ -55,7 +67,8 @@ export const config = {
 
   // ─── Position Management ────────────────
   management: {
-    minClaimAmount:        u.minClaimAmount        ?? 5,
+    minClaimAmount:        u.minClaimAmount        ?? 5,     // USD; used when solMode is off
+    minClaimAmountSol:     u.minClaimAmountSol     ?? 0.05,  // SOL; used when solMode is on (fees are then reported in SOL)
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     poolMaxDeploys:        u.poolMaxDeploys        ?? 4,   // max deploys per pool within rolling window
     poolDeployWindowDays:  u.poolDeployWindowDays  ?? 3,   // rolling window in days
@@ -65,7 +78,7 @@ export const config = {
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -15, // README has always said -15; the code said -50
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
@@ -85,7 +98,8 @@ export const config = {
   // ─── Strategy Mapping ───────────────────
   strategy: {
     strategy:  u.strategy  ?? "bid_ask",
-    binsBelow: u.binsBelow ?? 69,
+    binsBelow: u.binsBelow ?? 69,          // widest range (bins below price), used at volatility 5+
+    minBinsBelow: u.minBinsBelow ?? 35,    // narrowest range, used at volatility 0
   },
 
   // ─── Scheduling ─────────────────────────

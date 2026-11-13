@@ -405,6 +405,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Trim to final limit after all OKX filters — we held 3× headroom above to allow backfill
   if (eligible.length > limit) eligible.splice(limit);
   log("screening", `Final candidates after all filters: ${eligible.length}/${pools.length} screened`);
+  rememberScreened(eligible);
 
   return {
     candidates: eligible,
@@ -412,6 +413,35 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     filtered_examples: filteredOut,
     fetched_at: new Date().toISOString(),
   };
+}
+
+// ─── Screened-pool registry ────────────────────────────────────
+// Pools that came out of a recent screening run. executor.js only lets a deploy go into one of these, and
+// takes bin step / base mint / volatility from this record rather than from what the model says.
+const SCREENED_TTL_MS = 45 * 60_000;
+const _screened = new Map(); // pool address -> { pool, name, bin_step, base_mint, volatility, at }
+
+export function rememberScreened(pools) {
+  const now = Date.now();
+  for (const [k, v] of _screened) if (now - v.at > SCREENED_TTL_MS) _screened.delete(k);
+  for (const p of pools || []) {
+    if (!p?.pool) continue;
+    _screened.set(p.pool, {
+      pool: p.pool, name: p.name ?? null, bin_step: p.bin_step ?? null,
+      base_mint: p.base?.mint ?? null, volatility: p.volatility ?? null, at: now,
+    });
+  }
+}
+
+export function forgetScreened(poolAddress) {
+  _screened.delete(poolAddress);
+}
+
+export function getScreenedCandidate(poolAddress) {
+  const c = _screened.get(poolAddress);
+  if (!c) return null;
+  if (Date.now() - c.at > SCREENED_TTL_MS) { _screened.delete(poolAddress); return null; }
+  return c;
 }
 
 /**
