@@ -426,6 +426,7 @@ These are read from `user-config.json` only. The agent cannot change them throug
 | `maxSwapPriceImpactPct` | `15` | A swap quoted above this price impact is refused; the tokens stay in the wallet and you get a Telegram alert |
 | `requireRenouncedAuthorities` | `true` | Drop tokens whose mint or freeze authority is still active |
 | `failClosedOnMissingData` | `true` | A token with no audit / OKX risk data / price points is dropped. Set `false` to let "no data" pass, as before |
+| `manageUntrackedPositions` | `false` | `false` = positions in the wallet that the agent did not open (opened by hand or by another tool) are shown in reports but never closed or claimed. You get a Telegram note when one of the exit rules would have closed one. Set `true` to put every position in the wallet under the agent's rules |
 
 ### What is enforced in code (not by the prompt)
 
@@ -439,6 +440,16 @@ These are read from `user-config.json` only. The agent cannot change them throug
 - **Config.** `update_config` works in chat sessions only (not in the autonomous cycles) and every value is type-
   and range-checked (`guards.js`, `CONFIG_BOUNDS`).
 - **Tools per role.** The screener, manager and health-check roles can only call the tools they are shown.
+- **Token audit on every path.** Blocked launchpad, bot holders, mint / freeze authority and top-10 holders are
+  checked inside `get_top_candidates`, so a deploy asked for in chat, on Telegram or with `auto` passes the same
+  checks as the scheduled cycle.
+- **Leftover tokens.** If the swap back to SOL after a close fails (no route, price impact above the limit,
+  Jupiter down), the token is remembered and the swap is retried on every management check, up to 12 times.
+  After that you get a Telegram alert and the tokens stay in the wallet for you to sell.
+- **Data outages.** When OKX or the Jupiter audit has no data for any candidate, nothing can pass the screen. The
+  screening report and a Telegram alert say so, so it is not mistaken for a quiet market.
+- **Dry run.** A simulated close or deploy sends no "Closed" / "Deployed" message and is repeated at most once
+  an hour. The startup line says which of the two switches turned dry run on.
 
 `npm run test:guards` runs the unit tests for these checks (no network, no wallet).
 

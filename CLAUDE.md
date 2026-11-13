@@ -97,6 +97,9 @@ and `update_config` is refused for the autonomous SCREENER / MANAGER cycles (cha
 switches `allowTwoSided`, `allowUnscreenedDeploy`, `requireRenouncedAuthorities` and `failClosedOnMissingData`
 live in `user-config.json` only and are not reachable through `update_config`.
 
+`manageUntrackedPositions` (default `false`, `user-config.json` only): positions the agent did not open are
+reported as `WATCH` in the management cycle and never closed or claimed.
+
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
 ---
@@ -105,6 +108,8 @@ live in `user-config.json` only and are not reachable through `update_config`.
 
 1. **Deploy**: `deploy_position` → executor safety checks → `trackPosition()` in state.js → Telegram notify
 2. **Monitor**: management cron → `getMyPositions()` → `getPositionPnl()` → OOR detection → pool-memory snapshots
+   A failed auto-swap after a close is stored in `state.json` (`pendingSwaps`) and retried by
+   `retryPendingSwaps()` at the start of each management cycle (max 12 tries, then a Telegram alert).
 3. **Close**: decided by the deterministic rules in `runManagementCycle` and executed in code via `executeTool("close_position", …, { source: "rule" })` (the LLM is only consulted for positions with an owner instruction) → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
 4. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
 
@@ -118,6 +123,9 @@ A positions-API failure is `unknown: true` and blocks the deploy; it is never tr
 The pool must be in the latest screening result unless the deploy was typed by the owner at the CLI or
 `allowUnscreenedDeploy` is set. `bins_below` is computed in code from volatility. Positions are SOL-only unless
 `allowTwoSided` is set.
+
+The token audit (launchpad, bot holders, mint / freeze authority, top-10 holders) is `guards.js checkTokenAudit`,
+called from `getTopCandidates()` for every caller; a pool that fails it never enters the screened-pool registry.
 
 Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`

@@ -171,6 +171,13 @@ const heliusKey = await ask(
   alreadySet(ev("HELIUS_API_KEY", ""))
 );
 
+// Swaps go through Jupiter. The key is no longer bundled in the source: without one, selling the leftover
+// tokens after a close can be refused.
+const jupiterKey = await ask(
+  "Jupiter API key (for swaps — selling leftover tokens after a close)",
+  alreadySet(ev("JUPITER_API_KEY", ""))
+);
+
 // ─── Section 2: Telegram ──────────────────────────────────────────────────────
 console.log("\n── Telegram (optional — skip to disable) ─────────────────────");
 
@@ -357,6 +364,7 @@ const envMap = {
   ...(isKept(walletKey)     ? {} : { WALLET_PRIVATE_KEY: walletKey }),
   ...(rpcUrl                ? { RPC_URL: rpcUrl } : {}),
   ...(isKept(heliusKey)     ? {} : { HELIUS_API_KEY: heliusKey }),
+  ...(isKept(jupiterKey)    ? {} : { JUPITER_API_KEY: jupiterKey }),
   ...(isKept(telegramToken) ? {} : { TELEGRAM_BOT_TOKEN: telegramToken }),
   ...(telegramChatId        ? { TELEGRAM_CHAT_ID: telegramChatId } : {}),
   DRY_RUN: dryRun ? "true" : "false",
@@ -408,7 +416,7 @@ console.log(`
   Min balance:  ${minSolToOpen} SOL to open new position
   Timeframe:    ${timeframe}  ·  organic ≥ ${minOrganic}  ·  holders ≥ ${minHolders}
   Take profit:  fees ≥ ${takeProfitFeePct}%
-  Stop loss:    ${stopLossPct}% price drop
+  Stop loss:    position PnL ${stopLossPct}%
   OOR close:    after ${outOfRangeWaitMinutes} min
 
   Cycles:       management every ${managementIntervalMin}m  ·  screening every ${screeningIntervalMin}m
@@ -421,5 +429,5 @@ console.log(`
   Config:       ${CONFIG_PATH}
 
 Run "npm start" to launch the agent.
-${dryRun ? '\n  ⚠ DRY RUN is ON — set dryRun: false in user-config.json when ready for live trading.\n' : ""}
+${dryRun ? '\n  ⚠ DRY RUN is ON. To go live set DRY_RUN=false in .env AND "dryRun": false in user-config.json\n    (dry run stays on while either of the two says true), or run this wizard again.\n' : ""}${!jupiterKey && !existingEnv.JUPITER_API_KEY ? '\n  ⚠ No Jupiter API key set: add JUPITER_API_KEY to .env before going live.\n' : ""}
 `);

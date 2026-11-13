@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { resolveDryRun } from "./guards.js";
+import { resolveDryRun, parseFlag } from "./guards.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -18,7 +18,20 @@ if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
 // Dry run is ON if either .env or user-config asks for it, and every other module reads the canonical
 // "true"/"false" written back here. (`DRY_RUN=false` from .env.example used to override `"dryRun": true`.)
+const _dryEnv = parseFlag(process.env.DRY_RUN);
+const _dryFile = parseFlag(u.dryRun);
 process.env.DRY_RUN = resolveDryRun(process.env.DRY_RUN, u.dryRun) ? "true" : "false";
+/** Why dry run is on or off, for the startup line: an old `"dryRun": true` left in user-config.json keeps the
+ *  agent from trading even with DRY_RUN=false in .env, and that has to be visible. */
+export const dryRunInfo = {
+  on: process.env.DRY_RUN === "true",
+  env: _dryEnv,   // true | false | null (not set)
+  file: _dryFile, // true | false | null (not set)
+  describe() {
+    const f = (v) => (v === null ? "not set" : String(v));
+    return `.env DRY_RUN=${f(this.env)}, user-config dryRun=${f(this.file)} — dry run is on if either one says so`;
+  },
+};
 
 export const config = {
   // ─── Risk Limits ─────────────────────────
@@ -79,6 +92,9 @@ export const config = {
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -15, // README has always said -15; the code said -50
+    // Positions in the wallet that this agent did not open (opened by hand, or by another tool) are reported
+    // but never closed or claimed, unless this is switched on. user-config.json only.
+    manageUntrackedPositions: u.manageUntrackedPositions ?? false,
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close

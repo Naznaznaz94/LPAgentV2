@@ -7,13 +7,13 @@
  */
 
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { dataFile } from "./paths.js";
 
-// Next to this file, not relative to the working directory: started from elsewhere (global `meridian` command,
-// pm2 with another cwd) the list used to load empty without a word.
-const STRATEGY_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "strategy-library.json");
+// Next to the code, not relative to the working directory (paths.js): started from elsewhere (global
+// `meridian` command, pm2 with another cwd) the list used to load empty without a word. A copy an older version
+// left in the working directory is still picked up.
+const STRATEGY_FILE = dataFile("strategy-library.json");
 
 function load() {
   if (!fs.existsSync(STRATEGY_FILE)) return { active: null, strategies: {} };

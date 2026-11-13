@@ -181,15 +181,21 @@ export async function recordPerformance(perf) {
         reloadScreeningThresholds();
         log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
       }
+    }
+  }
 
-      // Darwinian signal weight recalculation
-      if (config.darwin?.enabled) {
-        const { recalculateWeights } = await import("./signal-weights.js");
-        if (recalculateWeights) {
-          const wResult = recalculateWeights(data.performance, config);
-          if (wResult.changes.length > 0) {
-            log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
-          }
+  // Darwinian signal weights: their own cadence (darwinRecalcEvery, default 5 closes) and their own minimum
+  // sample (darwinMinSamples). They used to ride on the threshold evolution above, so raising that to every 20
+  // closes slowed them down too.
+  if (!excludeFromLearning) {
+    const { config } = await import("./config.js");
+    const every = Math.max(1, config?.darwin?.recalcEvery ?? 5);
+    if (config?.darwin?.enabled && data.performance.length % every === 0) {
+      const { recalculateWeights } = await import("./signal-weights.js");
+      if (recalculateWeights) {
+        const wResult = recalculateWeights(data.performance, config);
+        if (wResult.changes.length > 0) {
+          log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
         }
       }
     }

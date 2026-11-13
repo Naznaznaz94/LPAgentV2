@@ -12,7 +12,7 @@ import {
 import { getWalletBalances, swapToken, normalizeMint } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, updateSignalSnapshot } from "../state.js";
+import { setPositionInstruction, updateSignalSnapshot, recordPendingSwap, clearPendingSwap } from "../state.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 
 import { getPoolMemory, addPoolNote, isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
@@ -337,8 +337,11 @@ export async function executeTool(name, args, ctx = {}) {
       success,
     });
 
-    if (success) {
+    // A dry run sent nothing: no "Deployed" / "Closed" message, no signals attached, no swap to follow up.
+    // (Telegram used to say "Closed … +$0.00" for every simulated close.)
+    if (success && !result?.dry_run) {
       if (name === "swap_token" && result.tx) {
+        if (normalizeMint(args.output_mint) === config.tokens.SOL) clearPendingSwap(normalizeMint(args.input_mint));
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
@@ -361,9 +364,11 @@ export async function executeTool(name, args, ctx = {}) {
             // Say what really happened: the bag is still in the wallet. (This used to report "already swapped".)
             result.auto_swapped = false;
             result.auto_swap_error = why;
-            result.auto_swap_note = `Auto-swap of the leftover ${sym} back to SOL FAILED (${why}). The tokens are still in the wallet.`;
+            result.auto_swap_note = `Auto-swap of the leftover ${sym} back to SOL FAILED (${why}). The tokens are still in the wallet; the swap is retried on the next management checks.`;
             log("executor_warn", `Auto-swap after close failed: ${why}`);
-            sendMessage(`⚠️ Closed ${result.pool_name || sym}, but the leftover tokens were NOT swapped to SOL: ${why}. They are still in the wallet — sell them by hand.`).catch(() => {});
+            // Remember it: index.js retries on every management check until it goes through or gives up.
+            recordPendingSwap(result.base_mint, { pool_name: result.pool_name || null, error: why });
+            sendMessage(`⚠️ Closed ${result.pool_name || sym}, but the leftover tokens were NOT swapped to SOL: ${why}. They are still in the wallet. The swap will be retried on the next checks; sell by hand if you do not want to wait.`).catch(() => {});
           };
           try {
             const balances = await getWalletBalances({});

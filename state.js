@@ -541,6 +541,48 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   return null;
 }
 
+// ─── Leftover tokens waiting to be sold ────────────────────────
+// When the swap back to SOL after a close fails (no route, price impact above the limit, API down), the mint is
+// kept here and the management cycle tries again. It used to be reported once and then left in the wallet.
+
+export function recordPendingSwap(mint, { pool_name = null, error = null } = {}) {
+  if (!mint) return;
+  const state = load();
+  if (!state.pendingSwaps) state.pendingSwaps = {};
+  const prev = state.pendingSwaps[mint];
+  state.pendingSwaps[mint] = {
+    mint,
+    pool_name: pool_name ?? prev?.pool_name ?? null,
+    since: prev?.since ?? new Date().toISOString(),
+    attempts: prev?.attempts ?? 0,
+    last_error: sanitizeStoredText(error, 200),
+  };
+  save(state);
+}
+
+export function getPendingSwaps() {
+  return Object.values(load().pendingSwaps || {});
+}
+
+/** Count one failed retry. Returns the number of retries so far. */
+export function notePendingSwapAttempt(mint, error) {
+  const state = load();
+  const item = state.pendingSwaps?.[mint];
+  if (!item) return 0;
+  item.attempts = (item.attempts ?? 0) + 1;
+  item.last_error = sanitizeStoredText(error, 200);
+  item.last_attempt_at = new Date().toISOString();
+  save(state);
+  return item.attempts;
+}
+
+export function clearPendingSwap(mint) {
+  const state = load();
+  if (!state.pendingSwaps?.[mint]) return;
+  delete state.pendingSwaps[mint];
+  save(state);
+}
+
 // ─── Briefing Tracking ─────────────────────────────────────────
 
 /**

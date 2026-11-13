@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   parseFlag, resolveDryRun, sanitizeUntrusted, validateConfigValue, validateConfigChanges,
-  binsBelowFor, checkDeploy, checkSwap, checkPriceImpact, quoteImpactPct, lockKey,
+  binsBelowFor, checkDeploy, checkSwap, checkPriceImpact, quoteImpactPct, lockKey, checkTokenAudit,
 } from "../guards.js";
 
 const SOL = "So11111111111111111111111111111111111111112";
@@ -135,4 +135,29 @@ test("quote impact: USD values win, an ambiguous small reported value is unknown
 test("lock keys: two different closes are two locks, a deploy is one", () => {
   assert.notEqual(lockKey("close_position", { position_address: "A" }), lockKey("close_position", { position_address: "B" }));
   assert.equal(lockKey("deploy_position", { pool_address: "A" }), lockKey("deploy_position", { pool_address: "B" }));
+});
+
+test("lock key and bins survive missing input", () => {
+  assert.equal(lockKey("close_position", null), "close_position:?");   // a model can send null arguments
+  assert.equal(lockKey("swap_token", undefined), "swap_token:?");
+  assert.equal(binsBelowFor(null), null);                               // unknown volatility is not "volatility 0"
+  assert.equal(binsBelowFor(""), null);
+  assert.equal(binsBelowFor(0), 35);
+});
+
+test("token audit: one check for every deploy path", () => {
+  const s = { failClosedOnMissingData: true, requireRenouncedAuthorities: true, maxBotHoldersPct: 30, maxTop10Pct: 60, blockedLaunchpads: ["bad.fun"] };
+  const ok = { launchpad: "pump.fun", audit: { mint_disabled: true, freeze_disabled: true, top_holders_pct: "22.10", bot_holders_pct: "8.00" } };
+  assert.equal(checkTokenAudit({ token: ok, screening: s }).pass, true);
+  assert.equal(checkTokenAudit({ token: { ...ok, launchpad: "bad.fun" }, screening: s }).pass, false);
+  assert.match(checkTokenAudit({ token: { ...ok, audit: { ...ok.audit, mint_disabled: false } }, screening: s }).reason, /mint authority/);
+  assert.match(checkTokenAudit({ token: { ...ok, audit: { ...ok.audit, freeze_disabled: false } }, screening: s }).reason, /freeze authority/);
+  assert.match(checkTokenAudit({ token: { ...ok, audit: { ...ok.audit, top_holders_pct: "71.5" } }, screening: s }).reason, /top-10/);
+  assert.match(checkTokenAudit({ token: { ...ok, audit: { ...ok.audit, bot_holders_pct: "45" } }, screening: s }).reason, /bot holders/);
+  // no data: dropped and counted as missing when failing closed, passed when the owner switched that off
+  const none = checkTokenAudit({ token: null, screening: s });
+  assert.equal(none.pass, false);
+  assert.equal(none.missing, true);
+  assert.equal(checkTokenAudit({ token: null, screening: { ...s, failClosedOnMissingData: false } }).pass, true);
+  assert.equal(checkTokenAudit({ token: { audit: { mint_disabled: null, freeze_disabled: true } }, screening: s }).missing, true);
 });

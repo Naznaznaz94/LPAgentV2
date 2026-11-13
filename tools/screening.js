@@ -3,6 +3,8 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
+import { getTokenInfo } from "./token.js";
+import { checkTokenAudit } from "../guards.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -224,6 +226,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // failClosedOnMissingData (default on): a check that cannot run for lack of data drops the candidate. These
   // used to pass on "no data", so an OKX or price-feed outage switched the safety filters off.
   const failClosed = config.screening.failClosedOnMissingData !== false;
+  // How many candidates each outside data source was asked about, and for how many it had nothing. When a
+  // source is down for every candidate the screen passes nobody; the result then says so (`outage`) instead of
+  // looking like an ordinary quiet market.
+  const gaps = { okx: { checked: 0, missing: 0 }, audit: { checked: 0, missing: 0 } };
   eligible.splice(0, eligible.length, ...eligible.filter((p) => {
     const trend = p.price_trend;
     const valid = Array.isArray(trend) ? trend.filter(v => v > 0) : []; // strip -1.0 placeholder values
@@ -330,7 +336,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (p.is_wash) return drop("wash trading flagged");
       if (p.is_rugpull) return drop("liquidity-removal (rug) flag");
       if (p.is_honeypot) return drop("honeypot tag");
-      if (failClosed && (p.is_wash == null || p.bundle_pct == null)) return drop("no OKX risk data for this token (failClosedOnMissingData)");
+      gaps.okx.checked += 1;
+      if (p.is_wash == null || p.bundle_pct == null) {
+        gaps.okx.missing += 1;
+        if (failClosed) return drop("no OKX risk data for this token (failClosedOnMissingData)");
+      }
       return true;
     }));
 
@@ -420,15 +430,54 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
   }
 
-  // Trim to final limit after all OKX filters — we held 3× headroom above to allow backfill
-  if (eligible.length > limit) eligible.splice(limit);
+  // Token audit (Jupiter): blocked launchpad, bot holders, mint / freeze authority, top-10 holders.
+  // It used to run only inside the scheduled screening cycle, after the pools had already been registered as
+  // deployable, so a deploy asked for in chat, on Telegram or with `auto` skipped it. Candidates are checked in
+  // rank order until `limit` have passed, so one bad token does not shrink the list.
+  const audited = [];
+  for (const p of eligible) {
+    if (audited.length >= limit) break;
+    let token = null;
+    if (p.base?.mint) {
+      try {
+        token = (await getTokenInfo({ query: p.base.mint }))?.results?.[0] ?? null;
+      } catch (e) {
+        log("screening", `Token info unavailable for ${p.name}: ${e.message}`);
+      }
+      await new Promise((r) => setTimeout(r, 150)); // avoid 429s
+    }
+    gaps.audit.checked += 1;
+    const verdict = checkTokenAudit({ token, screening: config.screening });
+    if (!verdict.pass) {
+      if (verdict.missing) gaps.audit.missing += 1;
+      log("screening", `Audit filter: dropped ${p.name} — ${verdict.reason}`);
+      pushFilteredReason(filteredOut, p, verdict.reason);
+      continue;
+    }
+    // Kept small on purpose: this object goes to the model with the candidate.
+    p.token = token
+      ? { launchpad: token.launchpad ?? null, global_fees_sol: token.global_fees_sol ?? null, audit: token.audit ?? null, stats_1h: token.stats_1h ?? null }
+      : null;
+    audited.push(p);
+  }
+  eligible.splice(0, eligible.length, ...audited);
+
   log("screening", `Final candidates after all filters: ${eligible.length}/${pools.length} screened`);
   rememberScreened(eligible);
+
+  const down = [];
+  if (failClosed && gaps.okx.checked >= 3 && gaps.okx.missing === gaps.okx.checked) down.push(`OKX risk data was unavailable for all ${gaps.okx.checked} candidates checked`);
+  if (failClosed && gaps.audit.checked >= 3 && gaps.audit.missing === gaps.audit.checked) down.push(`Jupiter token-audit data was unavailable for all ${gaps.audit.checked} candidates checked`);
+  const outage = down.length
+    ? `${down.join("; ")}. With failClosedOnMissingData on, nothing can pass the safety screen until that data is back.`
+    : null;
+  if (outage) log("screening_warn", outage);
 
   return {
     candidates: eligible,
     total_screened: pools.length,
     filtered_examples: filteredOut,
+    outage,
     fetched_at: new Date().toISOString(),
   };
 }

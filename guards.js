@@ -213,6 +213,8 @@ const SHAPES = new Set(["bid_ask", "spot", "curve"]);
 
 /** bins below the price from pool volatility: min at volatility 0, max at volatility 5+. Done in code, not by the model. */
 export function binsBelowFor(volatility, min = 35, max = 69) {
+  // Number(null) is 0: a pool with no volatility figure used to get the narrowest range. Unknown is unknown.
+  if (volatility === null || volatility === undefined || volatility === "") return null;
   const v = Number(volatility);
   if (!Number.isFinite(v)) return null;
   return Math.max(min, Math.min(max, Math.round(min + (Math.max(0, v) / 5) * (max - min))));
@@ -378,8 +380,49 @@ export function checkPriceImpact(impactPct, maxPct) {
  * Key for the "once per session" lock. Closing two different positions (or swapping two different tokens) in one
  * session is legitimate; doing the same one twice is not. A deploy stays one per session whatever the pool.
  */
-export function lockKey(name, args = {}) {
-  if (name === "close_position") return `${name}:${args.position_address ?? "?"}`;
-  if (name === "swap_token") return `${name}:${args.input_mint ?? "?"}`;
+export function lockKey(name, args) {
+  const a = args && typeof args === "object" ? args : {}; // a model can send `null` as arguments
+  if (name === "close_position") return `${name}:${a.position_address ?? "?"}`;
+  if (name === "swap_token") return `${name}:${a.input_mint ?? "?"}`;
   return name;
+}
+
+// ─── Token audit ───────────────────────────────────────────────
+
+/**
+ * Hard token checks that need the token's audit record (Jupiter): blocked launchpad, bot holders, mint / freeze
+ * authority, top-10 concentration. One function so that every way of reaching a deploy (scheduled cycle, chat,
+ * Telegram, the `auto` command) runs the same checks.
+ *
+ * @param {object} p
+ * @param {object|null} p.token  { launchpad, audit: { mint_disabled, freeze_disabled, top_holders_pct, bot_holders_pct } }
+ * @param {object} p.screening   config.screening
+ * @returns {{ pass: true } | { pass: false, reason: string, missing?: true }}
+ */
+export function checkTokenAudit({ token, screening: s = {} }) {
+  const failClosed = s.failClosedOnMissingData !== false;
+  const launchpad = token?.launchpad ?? null;
+  if (launchpad && Array.isArray(s.blockedLaunchpads) && s.blockedLaunchpads.includes(launchpad)) {
+    return { pass: false, reason: `blocked launchpad (${launchpad})` };
+  }
+  const audit = token?.audit ?? null;
+  if (!audit) {
+    return failClosed ? { pass: false, missing: true, reason: "no token audit data (failClosedOnMissingData)" } : { pass: true };
+  }
+  const bots = Number.parseFloat(audit.bot_holders_pct);
+  if (s.maxBotHoldersPct != null && Number.isFinite(bots) && bots > s.maxBotHoldersPct) {
+    return { pass: false, reason: `bot holders ${bots}% > ${s.maxBotHoldersPct}%` };
+  }
+  if (s.requireRenouncedAuthorities !== false) {
+    if (audit.mint_disabled === false) return { pass: false, reason: "mint authority is still active (supply can be inflated)" };
+    if (audit.freeze_disabled === false) return { pass: false, reason: "freeze authority is still active (your tokens can be frozen)" };
+    if (failClosed && (audit.mint_disabled == null || audit.freeze_disabled == null)) {
+      return { pass: false, missing: true, reason: "mint / freeze authority unknown (failClosedOnMissingData)" };
+    }
+  }
+  const top10 = Number.parseFloat(audit.top_holders_pct);
+  if (s.maxTop10Pct != null && Number.isFinite(top10) && top10 > s.maxTop10Pct) {
+    return { pass: false, reason: `top-10 holders ${top10}% > ${s.maxTop10Pct}%` };
+  }
+  return { pass: true };
 }
