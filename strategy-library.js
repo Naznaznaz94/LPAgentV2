@@ -8,8 +8,12 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { dataFile } from "./paths.js";
 
-const STRATEGY_FILE = "./strategy-library.json";
+// Next to the code, not relative to the working directory (paths.js): started from elsewhere (global
+// `meridian` command, pm2 with another cwd) the list used to load empty without a word. A copy an older version
+// left in the working directory is still picked up.
+const STRATEGY_FILE = dataFile("strategy-library.json");
 
 function load() {
   if (!fs.existsSync(STRATEGY_FILE)) return { active: null, strategies: {} };
@@ -105,7 +109,8 @@ function ensureDefaultStrategies() {
     }
   }
   if (added) {
-    if (!db.active) db.active = "custom_ratio_spot";
+    // No default active strategy. The built-in setup (SOL only, config.strategy) applies until the owner picks
+    // one; this used to activate custom_ratio_spot, a two-sided strategy, on first run.
     save(db);
     log("strategy", "Preloaded default strategies");
   }

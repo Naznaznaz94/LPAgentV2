@@ -128,16 +128,16 @@ Only call this if you need the current price to calculate a specific bin range (
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
+2. No user spec → use the configured shape; the range is sized by the executor, not by you
 
 HARD RULES:
 - Never use 'curve'.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
 
 Guidelines (only when user hasn't specified):
-- Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
-- Bins: choose 35–69 for standard volatility; up to 350 for wide-range strategies. Max 1400 total.
-- Deposit: Can be single-sided (SOL only or Base only) or dual-sided.
+- Strategy: use the configured shape (bid_ask unless told otherwise)
+- Range: leave bins_below out. The executor sizes the range in code: its bottom sits 60–70% below the entry price (deeper for volatile pools and small market caps), converted to bins for the pool's bin step.
+- Deposit: SOL only (amount_y) unless the owner has switched two-sided positions on.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -166,7 +166,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. If the user specifies a value, use it exactly. If they specify a % range (e.g. '-60% range'), convert using: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Example: -60% range at bin_step 100 → ceil(log(0.40)/log(1.01)) = 92 bins. Otherwise choose based on volatility: 35–69 standard, 100–350 for wide-range strategies. Max 1400 total."
+            description: "Leave it out. The executor sizes the range itself (bottom coverMinPct–coverMaxPct below the entry price) and ignores this value in the autonomous cycles and in chat. If the owner asks for a different range in chat, tell him the two ways to get it: change coverMinPct / coverMaxPct with update_config and then deploy, or deploy from the CLI with --bins-below. For reference, a % range converts as bins = ceil(log(1 / (1 - pct)) / log(1 + bin_step/10000)); -60% at bin_step 100 = 93 bins."
           },
           bins_above: {
             type: "number",

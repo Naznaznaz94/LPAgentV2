@@ -15,7 +15,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 
 const LESSONS_FILE = path.join(__dirname, "lessons.json");
-const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
+const MIN_EVOLVE_POSITIONS = 20;  // don't evolve until we have real data (was 5: two losers and one winner could move a threshold)
+const MIN_EVOLVE_SIDE      = 5;   // winners AND losers each need this many records before a threshold may move
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 const MAX_MANUAL_LESSON_LENGTH = 400;
 
@@ -104,9 +105,12 @@ export async function recordPerformance(perf) {
     pnl_pct <= -90 &&
     !closeReasonText.includes("stop loss");
 
-  if (suspiciousAbsurdClosedPnl) {
-    log("lessons_warn", `Skipped absurd closed PnL record for ${perf.pool_name || perf.pool}: pnl_pct=${pnl_pct.toFixed(2)} reason=${perf.close_reason}`);
-    return;
+  // A -90% close that was not a stop loss may be bad data, so it is kept out of the lessons and out of the
+  // threshold evolution. The pool still gets its close recorded below (cooldowns): returning here used to make
+  // a real rug vanish without a record or a cooldown.
+  const excludeFromLearning = suspiciousAbsurdClosedPnl;
+  if (excludeFromLearning) {
+    log("lessons_warn", `Absurd closed PnL for ${perf.pool_name || perf.pool}: pnl_pct=${pnl_pct.toFixed(2)} reason=${perf.close_reason} — kept out of lessons, pool memory still updated`);
   }
 
   const closeReasonLower = String(perf.close_reason || "").toLowerCase();
@@ -114,7 +118,7 @@ export async function recordPerformance(perf) {
   // Only use OOR grade when PnL was negative (the exit was forced by drift, not profit-taking).
   const grade = pnl_pct > 2 ? "A"
     : pnl_pct >= 0 ? "B"
-    : (closeReasonLower.includes("out of range") || closeReasonLower.includes("oor")) ? "OOR"
+    : (closeReasonLower.includes("out of range") || /\boor\b/.test(closeReasonLower)) ? "OOR" // \b: "poor" is not "oor"
     : "C";
 
   const entry = {
@@ -126,16 +130,18 @@ export async function recordPerformance(perf) {
     recorded_at: new Date().toISOString(),
   };
 
-  data.performance.push(entry);
+  if (!excludeFromLearning) {
+    data.performance.push(entry);
 
-  // Derive and store a lesson
-  const lesson = derivLesson(entry);
-  if (lesson) {
-    data.lessons.push(lesson);
-    log("lessons", `New lesson: ${lesson.rule}`);
+    // Derive and store a lesson
+    const lesson = derivLesson(entry);
+    if (lesson) {
+      data.lessons.push(lesson);
+      log("lessons", `New lesson: ${lesson.rule}`);
+    }
+
+    save(data);
   }
-
-  save(data);
 
   // Update pool-level memory
   if (perf.pool) {
@@ -166,8 +172,8 @@ export async function recordPerformance(perf) {
     });
   }
 
-  // Evolve thresholds every 5 closed positions
-  if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
+  // Evolve thresholds every MIN_EVOLVE_POSITIONS closed positions
+  if (!excludeFromLearning && data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
     const { config, reloadScreeningThresholds } = await import("./config.js");
     if (config) {
       const result = evolveThresholds(data.performance, config);
@@ -175,15 +181,21 @@ export async function recordPerformance(perf) {
         reloadScreeningThresholds();
         log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
       }
+    }
+  }
 
-      // Darwinian signal weight recalculation
-      if (config.darwin?.enabled) {
-        const { recalculateWeights } = await import("./signal-weights.js");
-        if (recalculateWeights) {
-          const wResult = recalculateWeights(data.performance, config);
-          if (wResult.changes.length > 0) {
-            log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
-          }
+  // Darwinian signal weights: their own cadence (darwinRecalcEvery, default 5 closes) and their own minimum
+  // sample (darwinMinSamples). They used to ride on the threshold evolution above, so raising that to every 20
+  // closes slowed them down too.
+  if (!excludeFromLearning) {
+    const { config } = await import("./config.js");
+    const every = Math.max(1, config?.darwin?.recalcEvery ?? 5);
+    if (config?.darwin?.enabled && data.performance.length % every === 0) {
+      const { recalculateWeights } = await import("./signal-weights.js");
+      if (recalculateWeights) {
+        const wResult = recalculateWeights(data.performance, config);
+        if (wResult.changes.length > 0) {
+          log("evolve", `Darwin: adjusted ${wResult.changes.length} signal weight(s)`);
         }
       }
     }
@@ -230,7 +242,7 @@ function derivLesson(perf) {
 
   if (outcome === "good" || outcome === "bad" || outcome === "neutral" || outcome === "poor") {
     if (perf.range_efficiency < 30 && (outcome === "bad" || outcome === "poor")) {
-      rule = `AVOID: ${safePoolName}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
+      rule = `AVOID: ${safePoolName}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider a wider bin range${perf.strategy === "bid_ask" ? "" : " or the bid_ask shape"}.`;
       tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && (outcome === "good" || outcome === "neutral")) {
       rule = `PREFER: ${safePoolName}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
@@ -281,8 +293,9 @@ export function evolveThresholds(perfData, config) {
   const winners = perfData.filter((p) => p.pnl_pct > 0);
   const losers  = perfData.filter((p) => p.pnl_pct < -5);
 
-  // Need at least some signal in both directions before adjusting
-  const hasSignal = winners.length >= 2 || losers.length >= 2;
+  // Need a real sample on BOTH sides before adjusting. (This was "2 winners OR 2 losers": the floors below only
+  // ever go up, so a couple of lucky or unlucky trades could ratchet the screen tighter for good.)
+  const hasSignal = winners.length >= MIN_EVOLVE_SIDE && losers.length >= MIN_EVOLVE_SIDE;
   if (!hasSignal) return null;
 
   const changes   = {};
@@ -298,7 +311,7 @@ export function evolveThresholds(perfData, config) {
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const current    = config.screening.minFeeActiveTvlRatio;
 
-    if (winnerFees.length >= 2) {
+    if (winnerFees.length >= MIN_EVOLVE_SIDE) {
       const minWinnerFee = Math.min(...winnerFees);
       if (minWinnerFee > current * 1.2) {
         const target  = minWinnerFee * 0.85;
@@ -311,7 +324,7 @@ export function evolveThresholds(perfData, config) {
       }
     }
 
-    if (loserFees.length >= 2) {
+    if (loserFees.length >= MIN_EVOLVE_SIDE) {
       const maxLoserFee = Math.max(...loserFees);
       if (maxLoserFee < current * 1.5 && winnerFees.length > 0) {
         const minWinnerFee = Math.min(...winnerFees);
@@ -335,7 +348,7 @@ export function evolveThresholds(perfData, config) {
     const winnerOrganics = winners.map((p) => p.organic_score).filter(isFiniteNum);
     const current        = config.screening.minOrganic;
 
-    if (loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
+    if (loserOrganics.length >= MIN_EVOLVE_SIDE && winnerOrganics.length >= MIN_EVOLVE_SIDE) {
       const avgLoserOrganic  = avg(loserOrganics);
       const avgWinnerOrganic = avg(winnerOrganics);
       // Only raise if there's a clear gap (winners consistently more organic)

@@ -87,6 +87,7 @@ import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
+import { lockKey } from "./guards.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
@@ -142,7 +143,12 @@ function isToolChoiceRequiredError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { requireTool = false, interactive = false, onToolStart = null, onToolFinish = null } = options;
+  // allowedTools (optional Set): narrows the role's tools further, e.g. a read-only set for the health check.
+  const { requireTool = false, interactive = false, onToolStart = null, onToolFinish = null, allowedTools = null } = options;
+  // The tools this session may use. The same set is both shown to the model AND enforced when it calls one:
+  // before, the role sets only filtered what was shown, so a model could still name any tool in the executor.
+  const roleTools = getToolsForRole(agentType, goal).filter((t) => !allowedTools || allowedTools.has(t.function.name));
+  const roleToolNames = new Set(roleTools.map((t) => t.function.name));
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -159,6 +165,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
+  let blockedDeploys = 0; // deploys refused by a safety check (nothing was sent): the model may try another pool, a few times
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, requireTool);
   let sawToolCall = false;
   let noToolRetryCount = 0;
@@ -183,7 +190,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           response = await client.chat.completions.create({
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, goal),
+            tools: roleTools,
             tool_choice: toolChoice,
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
@@ -301,12 +308,22 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
 
+        if (!roleToolNames.has(functionName)) {
+          const reason = `${functionName} is not available to the ${agentType} role in this session.`;
+          log("safety_block", `Blocked out-of-role tool call: ${functionName} (${agentType})`);
+          await onToolFinish?.({ name: functionName, args: functionArgs, result: { blocked: true, reason }, success: false, step });
+          return { role: "tool", tool_call_id: toolCall.id, content: JSON.stringify({ blocked: true, reason }) };
+        }
+
         // Optimistic lock — record whether it was already fired BEFORE setting the lock,
         // then set the lock immediately (before any await) so parallel calls in the same
         // Promise.all step both see it and the second one is blocked.
-        const wasAlreadyFired = firedOnce.has(functionName);
+        // The lock is per target (guards.js lockKey): closing three different positions in one session is
+        // legitimate, closing the same one twice is not. A deploy stays one per session whatever the pool.
+        const key = lockKey(functionName, functionArgs);
+        const wasAlreadyFired = firedOnce.has(key);
         if (ONCE_PER_SESSION.has(functionName) || NO_RETRY_TOOLS.has(functionName)) {
-          firedOnce.add(functionName); // lock now, before await — fixes parallel call race
+          firedOnce.add(key); // lock now, before await — fixes parallel call race
         }
 
         // Block once-per-session tools from firing a second time
@@ -327,7 +344,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });
-        const result = await executeTool(functionName, functionArgs);
+        const result = await executeTool(functionName, functionArgs, { agentType, interactive });
         await onToolFinish?.({
           name: functionName,
           args: functionArgs,
@@ -340,7 +357,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         // For ONCE_PER_SESSION non-NO_RETRY tools (close/swap): if the call failed,
         // remove the lock so a genuine retry is allowed in a subsequent step.
         if (ONCE_PER_SESSION.has(functionName) && !NO_RETRY_TOOLS.has(functionName) && result?.success === false && !result?.blocked) {
-          firedOnce.delete(functionName);
+          firedOnce.delete(key);
+        }
+        // A deploy refused by a safety check sent nothing on-chain: release the lock so the model can go to its
+        // next candidate, instead of ending the cycle on the first blocked pool. Capped at 3 refusals.
+        if (functionName === "deploy_position" && result?.blocked && ++blockedDeploys < 3) {
+          firedOnce.delete(key);
         }
 
         return {

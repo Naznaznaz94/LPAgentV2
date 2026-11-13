@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { checkBounceExit } from "./guards.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "state.json");
@@ -37,7 +38,15 @@ function load() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
+    // Keep the unreadable file: the next save() would otherwise replace it with an empty registry and every
+    // tracked position (trailing peaks, out-of-range timers, instructions) would be gone for good.
+    const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+    try {
+      fs.copyFileSync(STATE_FILE, backup);
+      log("state_error", `state.json is unreadable (${err.message}) — copied to ${path.basename(backup)}, starting from an empty registry`);
+    } catch (copyErr) {
+      log("state_error", `Failed to read state.json: ${err.message}; backup also failed: ${copyErr.message}`);
+    }
     return { positions: {}, recentEvents: [], lastUpdated: null };
   }
 }
@@ -45,7 +54,14 @@ function load() {
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const tmp = `${STATE_FILE}.tmp`;
+    const body = JSON.stringify(state, null, 2);
+    fs.writeFileSync(tmp, body);
+    try {
+      fs.renameSync(tmp, STATE_FILE);
+    } catch {
+      fs.writeFileSync(STATE_FILE, body); // e.g. Windows: target briefly locked by another process
+    }
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
@@ -84,6 +100,9 @@ export function trackPosition({
     amount_sol,
     amount_x,
     active_bin_at_deploy: active_bin,
+    low_bin: active_bin ?? null,   // lowest active bin seen since the open (updatePnlAndCheckExits)
+    low_bin_at: null,
+    low_bin_pending: null,         // a lower reading waiting for a second one to confirm it
     bin_step,
     volatility,
     fee_tvl_ratio,
@@ -433,21 +452,20 @@ export function getStateSummary() {
  * Returns { action, reason } or null if no exit needed.
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h, active_bin, lower_bin, upper_bin } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
-      const reason = pos.confirmed_trailing_exit_reason;
-      pos.confirmed_trailing_exit_reason = null;
-      pos.confirmed_trailing_exit_until = null;
-      save(state);
-      return { action: "TRAILING_TP", reason, confirmed_recheck: true };
+      // Not cleared on read: the poller sees it first, the management cycle that closes must see it too.
+      // It ends when the position is closed, or when the window below runs out.
+      return { action: "TRAILING_TP", reason: pos.confirmed_trailing_exit_reason, confirmed_recheck: true };
     }
     pos.confirmed_trailing_exit_reason = null;
     pos.confirmed_trailing_exit_until = null;
+    save(state);
   }
 
   let changed = false;
@@ -470,6 +488,37 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} back in range`);
   }
 
+  // Lowest price seen since the open, as a bin id. The bounce exit needs to know how deep price went.
+  // The low only ever moves down, so one wrong reading from the API would stay for good and fake a deep dip.
+  // A reading inside or near the range is taken at once (a real low can last a single check). A reading more
+  // than a full range-width below the bottom is not believable on its own: it needs a second such reading in
+  // a row, and the less extreme of the two is kept.
+  if (Number.isFinite(active_bin)) {
+    const width = Number.isFinite(upper_bin) && Number.isFinite(lower_bin) ? upper_bin - lower_bin : null;
+    const plausible = width == null || width <= 0 || active_bin >= lower_bin - width;
+    if (!Number.isFinite(pos.low_bin)) {
+      if (plausible) {
+        pos.low_bin = active_bin;
+        changed = true;
+      }
+    } else if (active_bin < pos.low_bin) {
+      const confirmed = plausible
+        ? active_bin
+        : Number.isFinite(pos.low_bin_pending) ? Math.max(pos.low_bin_pending, active_bin) : null;
+      if (confirmed != null && confirmed < pos.low_bin) {
+        pos.low_bin = confirmed;
+        pos.low_bin_at = new Date().toISOString();
+        pos.low_bin_pending = null;
+      } else if (!plausible) {
+        pos.low_bin_pending = active_bin;
+      }
+      changed = true;
+    } else if (Number.isFinite(pos.low_bin_pending)) {
+      pos.low_bin_pending = null;
+      changed = true;
+    }
+  }
+
   if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
@@ -478,6 +527,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       action: "STOP_LOSS",
       reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
     };
+  }
+
+  // ── Bounce exit: price went deep into the range and is coming back up ──
+  // The top of the range is the entry price for a SOL-only position; for a two-sided one the dump side starts
+  // at the entry price, not at the upper bin.
+  const topBin = Number.isFinite(pos.active_bin_at_deploy) && Number.isFinite(upper_bin)
+    ? Math.min(upper_bin, pos.active_bin_at_deploy)
+    : upper_bin;
+  const bounce = checkBounceExit(
+    { topBin, lowerBin: lower_bin, activeBin: active_bin, lowBin: pos.low_bin, binStep: pos.bin_step },
+    mgmtConfig);
+  if (bounce.exit) {
+    return { action: "BOUNCE_EXIT", reason: bounce.reason };
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
@@ -499,10 +561,17 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+    // Above the range the position is all SOL and only idle; below it, it holds the token. Different waits.
+    // Far above (more than outOfRangeBinsToClose bins) it is less likely to come back soon: the short wait again.
+    const above = Number.isFinite(active_bin) && Number.isFinite(upper_bin) && active_bin > upper_bin;
+    const farAbove = above && active_bin > upper_bin + (mgmtConfig.outOfRangeBinsToClose ?? Infinity);
+    const limit = above && !farAbove
+      ? (mgmtConfig.outOfRangeAboveWaitMinutes ?? mgmtConfig.outOfRangeWaitMinutes)
+      : mgmtConfig.outOfRangeWaitMinutes;
+    if (minutesOOR >= limit) {
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        reason: `Out of range ${farAbove ? "far above (idle)" : above ? "above (idle)" : "below"} for ${minutesOOR}m (limit: ${limit}m)`,
       };
     }
   }
@@ -525,6 +594,48 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   }
 
   return null;
+}
+
+// ─── Leftover tokens waiting to be sold ────────────────────────
+// When the swap back to SOL after a close fails (no route, price impact above the limit, API down), the mint is
+// kept here and the management cycle tries again. It used to be reported once and then left in the wallet.
+
+export function recordPendingSwap(mint, { pool_name = null, error = null } = {}) {
+  if (!mint) return;
+  const state = load();
+  if (!state.pendingSwaps) state.pendingSwaps = {};
+  const prev = state.pendingSwaps[mint];
+  state.pendingSwaps[mint] = {
+    mint,
+    pool_name: pool_name ?? prev?.pool_name ?? null,
+    since: prev?.since ?? new Date().toISOString(),
+    attempts: prev?.attempts ?? 0,
+    last_error: sanitizeStoredText(error, 200),
+  };
+  save(state);
+}
+
+export function getPendingSwaps() {
+  return Object.values(load().pendingSwaps || {});
+}
+
+/** Count one failed retry. Returns the number of retries so far. */
+export function notePendingSwapAttempt(mint, error) {
+  const state = load();
+  const item = state.pendingSwaps?.[mint];
+  if (!item) return 0;
+  item.attempts = (item.attempts ?? 0) + 1;
+  item.last_error = sanitizeStoredText(error, 200);
+  item.last_attempt_at = new Date().toISOString();
+  save(state);
+  return item.attempts;
+}
+
+export function clearPendingSwap(mint) {
+  const state = load();
+  if (!state.pendingSwaps?.[mint]) return;
+  delete state.pendingSwaps[mint];
+  save(state);
 }
 
 // ─── Briefing Tracking ─────────────────────────────────────────

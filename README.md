@@ -28,12 +28,30 @@ Meridian runs a **ReAct agent loop** — each cycle the LLM reasons over live da
 
 **Data sources:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close transactions
-- Meteora DLMM PnL API — position yield, fee accrual, PnL
+- Meteora DLMM data API (`dlmm.datapi.meteora.ag`, free, no key) — open positions, position yield and PnL, and
+  the pool's own candles in SOL, which the entry rule is measured on
 - OKX OnchainOS — smart money signals, token risk scoring
 - Pool screening API — fee/TVL ratios, volume, organic scores, holder counts
 - Jupiter API — token audit, mcap, launchpad, price stats
 
 Agents are powered via **OpenRouter** and can be swapped for any compatible model.
+
+### The default setup: wait for the pullback, deep range, leave on the bounce
+
+All three parts are enforced in code (`guards.js`); the model only picks which of the passing pools to enter.
+
+| Step | Rule | Why |
+|---|---|---|
+| **Entry** | Not at the top. A pool is offered only when its price is **20–30% below its 24h high** and has **stopped making new lows** (no new low for 15 min and at least +2% off the low). A token down more than 50% from its 3-day high is skipped. | A SOL-only range starts buying at the entry price. Opened at the high, the first bins buy the day's most expensive tokens and an ordinary pullback already puts the position under water. Opened after the pullback, it buys from a lower price and a retest of the low lands inside the range. |
+| **Range** | SOL only, bottom **60–70% below the entry price**: the deep end for volatile pools and for market caps under $3M. Converted to bins for the pool's bin step (−60% at bin step 100 = 93 bins, −70% = 121). | Entering after a pullback means entering at a lower market cap, where falls are deeper. −65% below a price that is already 25% off the high reaches about −74% from the high. |
+| **Shape** | `bid_ask`: most of the SOL sits in the lower bins. | On a deep range it is the low-risk shape: a 40% fall into a −70% range costs about 3% of the position before fees with `bid_ask`, about 9% with `spot`. The price: fewer fees while price chops near the top of the range. |
+| **Exit** | Stop loss at −15% PnL (about three quarters of the way down a −70% `bid_ask` range). Trailing take-profit. **Bounce exit**: once price has been past half of the range, the first +10% bounce off the low closes the position (+6% once it has been past three quarters). Price above the range (idle, all SOL): closed after 120 min. | "Let it dump, leave on the bounce." Waiting for a full recovery from deep in the range is where the large losses come from. |
+
+The high is the highest candle *body* in the window, not the wick, and is read from the pool's own candles on
+Meteora (SOL per token). If Meteora has no candles for a pool, OKX's 24h high is used instead, with the direction
+of the last price step standing in for "has it stopped falling". With neither, the pool is skipped.
+
+To go back to the old behaviour set `"entryMode": "momentum"` and `"rangeMode": "bins"`.
 
 ---
 
@@ -75,10 +93,15 @@ WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
+JUPITER_API_KEY=your_jupiter_key        # for swaps and prices (no longer hard-coded in the source)
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # auto-filled on first message
 DRY_RUN=true                            # set false for live trading
 ```
+
+Dry run is **on if either** `DRY_RUN` in `.env` **or** `"dryRun": true` in `user-config.json` asks for it. To go
+live, both must say so (`DRY_RUN=false` and `"dryRun": false`, or leave one of them out). Any other value of
+`DRY_RUN` (`1`, `True`, a typo) counts as dry run.
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
 
@@ -395,6 +418,12 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBundlersPct` | `30` | Maximum bundler % in top 100 holders |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
+| `entryMode` | `dip` | `dip` = wait for the pullback (below). `momentum` = the older rule: price stepping up over the last candles |
+| `entryDipMinPct` / `entryDipMaxPct` | `20` / `30` | The pullback zone: price must be this far below its recent high |
+| `entryDipLookbackHours` | `24` | Window the high is taken from |
+| `entrySettleMinutes` | `15` | No new low for this long before entering |
+| `entrySettleBouncePct` | `2` | Price must be at least this far back up off the low |
+| `entryMaxFall3dPct` | `50` | Skip a token down more than this from its 3-day high. `null` = off |
 
 ### Management
 
@@ -405,8 +434,59 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxDeployAmount` | `50` | Maximum SOL cap per position |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
-| `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
-| `stopLossPct` | `-15` | Close position if price drops by this % |
+| `outOfRangeWaitMinutes` | `30` | Minutes out of range **below** before closing |
+| `outOfRangeAboveWaitMinutes` | `120` | Minutes out of range **above** (idle, all SOL) before closing. Once price is more than `outOfRangeBinsToClose` (10) bins above, the shorter `outOfRangeWaitMinutes` applies |
+| `trailingTriggerPct` / `trailingDropPct` | `3` / `1.5` | Trailing take-profit: switches on at this PnL %, closes when PnL falls this many points from its peak. This is the only take-profit rule; `takeProfitFeePct` from the setup wizard is not read by any rule |
+| `bounceExit` | `true` | Leave on the bounce once price has been deep in the range |
+| `bounceExitMinDepthPct` | `50` | How far into the range the low must have gone |
+| `bounceExitPct` / `bounceExitDeepPct` | `10` / `6` | Bounce off the low that closes the position; the second applies past 75% of the range |
+| `minAgeBeforeYieldCheck` | `180` | Minutes before a low fee yield can close a position |
+| `stopLossPct` | `-15` | Close the position when its PnL falls to this % |
+| `minClaimAmountSol` | `0.05` | Claim threshold in SOL, used when `solMode` is on (`minClaimAmount` is USD) |
+| `strategy` | `bid_ask` | Shape of the deposit: `bid_ask`, `spot` or `curve` |
+| `rangeMode` | `cover` | `cover` = range bottom `coverMinPct`–`coverMaxPct` below entry. `bins` = `minBinsBelow`–`binsBelow` bins by volatility |
+| `coverMinPct` / `coverMaxPct` | `60` / `70` | How far below the entry price the range reaches (calm pool / volatile pool) |
+| `coverDeepBelowMcap` | `3000000` | Market caps under this (USD) always get `coverMaxPct`. `null` = off |
+| `maxBinsBelow` | `200` | Hard cap on the number of bins, whatever the cover asks for |
+| `minBinsBelow` / `binsBelow` | `35` / `69` | Only for `rangeMode: "bins"`: narrowest and widest range |
+
+### Safety switches
+
+These are read from `user-config.json` only. The agent cannot change them through `update_config`.
+
+| Field | Default | Description |
+|---|---|---|
+| `allowTwoSided` | `false` | `false` = SOL-only positions: `amount_x`, `bins_above` and SOL → token swaps are refused in code |
+| `allowUnscreenedDeploy` | `false` | `false` = the model can only deploy into a pool from the latest screening result. Deploys you type yourself with `node cli.js deploy` may name any pool |
+| `maxSwapPriceImpactPct` | `15` | A swap quoted above this price impact is refused; the tokens stay in the wallet and you get a Telegram alert |
+| `requireRenouncedAuthorities` | `true` | Drop tokens whose mint or freeze authority is still active |
+| `failClosedOnMissingData` | `true` | A token with no audit / OKX risk data / price points is dropped. Set `false` to let "no data" pass, as before |
+| `manageUntrackedPositions` | `false` | `false` = positions in the wallet that the agent did not open (opened by hand or by another tool) are shown in reports but never closed or claimed. You get a Telegram note when one of the exit rules would have closed one. Set `true` to put every position in the wallet under the agent's rules |
+
+### What is enforced in code (not by the prompt)
+
+- **Exits.** Stop loss, trailing take-profit, out-of-range and low-yield closes are executed directly by `index.js`.
+  The model is only asked about positions that carry your own instruction (`/set <n> <note>`). A model outage
+  cannot stop a stop loss; a close that fails raises a Telegram alert and is retried.
+- **API failures.** If the positions API fails, the cycle is skipped and reported. It is never read as "no positions".
+- **Deploys.** Pool must be screened; bin step and base token come from the screening record and the on-chain
+  pool; `bins_below` is computed from volatility; size is capped at `positionSizePct` of the wallet and
+  `maxDeployAmount`; one position per token.
+- **Config.** `update_config` works in chat sessions only (not in the autonomous cycles) and every value is type-
+  and range-checked (`guards.js`, `CONFIG_BOUNDS`).
+- **Tools per role.** The screener, manager and health-check roles can only call the tools they are shown.
+- **Token audit on every path.** Blocked launchpad, bot holders, mint / freeze authority and top-10 holders are
+  checked inside `get_top_candidates`, so a deploy asked for in chat, on Telegram or with `auto` passes the same
+  checks as the scheduled cycle.
+- **Leftover tokens.** If the swap back to SOL after a close fails (no route, price impact above the limit,
+  Jupiter down), the token is remembered and the swap is retried on every management check, up to 12 times.
+  After that you get a Telegram alert and the tokens stay in the wallet for you to sell.
+- **Data outages.** When OKX or the Jupiter audit has no data for any candidate, nothing can pass the screen. The
+  screening report and a Telegram alert say so, so it is not mistaken for a quiet market.
+- **Dry run.** A simulated close or deploy sends no "Closed" / "Deployed" message and is repeated at most once
+  an hour. The startup line says which of the two switches turned dry run on.
+
+`npm run test:guards` runs the unit tests for these checks (no network, no wallet).
 
 ### Schedule
 
@@ -546,7 +626,8 @@ tools/
   definitions.js    Tool schemas (OpenAI format)
   executor.js       Tool dispatch + safety checks
   dlmm.js           Meteora DLMM SDK wrapper
-  screening.js      Pool discovery
+  screening.js      Pool discovery + entry rule + token audit
+  meteora.js        Meteora data API: pool candles (pullback check), pool record
   wallet.js         SOL/token balances + Jupiter swap
   token.js          Token info, holders, narrative
   study.js          Top LPer study via LPAgent API

@@ -26,7 +26,8 @@ tools/
   definitions.js    Tool schemas in OpenAI format (what LLM sees)
   executor.js       Tool dispatch: name → fn, safety checks, pre/post hooks
   dlmm.js           Meteora DLMM SDK wrapper (deploy, close, claim, positions, PnL)
-  screening.js      Pool discovery from Meteora API
+  screening.js      Pool discovery from Meteora API, entry rule, token audit
+  meteora.js        Meteora data API (dlmm.datapi.meteora.ag): pool candles for the pullback check, pool record
   wallet.js         SOL/token balances (Helius) + Jupiter swap
   token.js          Token info/holders/narrative (Jupiter API)
   study.js          Top LPer study via LPAgent API
@@ -88,9 +89,26 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| outOfRangeAboveWaitMinutes | management | 120 |
+| bounceExit / bounceExitMinDepthPct / bounceExitPct / bounceExitDeepPct | management | true / 50 / 10 / 6 |
+| minAgeBeforeYieldCheck | management | 180 |
+| entryMode | screening | "dip" |
+| entryDipMinPct / entryDipMaxPct / entryDipLookbackHours | screening | 20 / 30 / 24 |
+| entrySettleMinutes / entrySettleBouncePct | screening | 15 / 2 |
+| entryMaxFall3dPct | screening | 50 |
+| rangeMode | strategy | "cover" |
+| coverMinPct / coverMaxPct / coverDeepBelowMcap / maxBinsBelow | strategy | 60 / 70 / 3,000,000 / 200 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
+
+**Hard bounds:** every key above is type- and range-checked in `guards.js` (`CONFIG_BOUNDS`) before it is applied,
+and `update_config` is refused for the autonomous SCREENER / MANAGER cycles (chat sessions only). The safety
+switches `allowTwoSided`, `allowUnscreenedDeploy`, `requireRenouncedAuthorities` and `failClosedOnMissingData`
+live in `user-config.json` only and are not reachable through `update_config`.
+
+`manageUntrackedPositions` (default `false`, `user-config.json` only): positions the agent did not open are
+reported as `WATCH` in the management cycle and never closed or claimed.
 
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
@@ -100,12 +118,24 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 1. **Deploy**: `deploy_position` → executor safety checks → `trackPosition()` in state.js → Telegram notify
 2. **Monitor**: management cron → `getMyPositions()` → `getPositionPnl()` → OOR detection → pool-memory snapshots
-3. **Close**: `close_position` → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
+   A failed auto-swap after a close is stored in `state.json` (`pendingSwaps`) and retried by
+   `retryPendingSwaps()` at the start of each management cycle (max 12 tries, then a Telegram alert).
+3. **Close**: decided by the deterministic rules in `runManagementCycle` and executed in code via `executeTool("close_position", …, { source: "rule" })` (the LLM is only consulted for positions with an owner instruction) → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
 4. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
 
 ---
 
-## Screener Safety Checks (executor.js)
+## Screener Safety Checks (executor.js → guards.js `checkDeploy`)
+
+All yes/no logic lives in `guards.js` (pure, unit-tested: `npm run test:guards`). The executor gathers the facts
+(open positions, wallet balance, the pool's record from the latest screening run) and applies the verdict.
+A positions-API failure is `unknown: true` and blocks the deploy; it is never treated as "no positions".
+The pool must be in the latest screening result unless the deploy was typed by the owner at the CLI or
+`allowUnscreenedDeploy` is set. `bins_below` is computed in code from volatility. Positions are SOL-only unless
+`allowTwoSided` is set.
+
+The token audit (launchpad, bot holders, mint / freeze authority, top-10 holders) is `guards.js checkTokenAudit`,
+called from `getTopCandidates()` for every caller; a pool that fails it never enters the screened-pool registry.
 
 Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`
@@ -118,17 +148,41 @@ Before `deploy_position` executes:
 
 ---
 
-## bins_below Calculation (SCREENER)
+## Entry, range and exit (all in `guards.js`, unit-tested)
 
-Linear formula based on pool volatility (set in screener prompt, `index.js`):
+**Entry — `checkDipEntry`** (`screening.entryMode: "dip"`, the default). `getTopCandidates()` reads each pool's
+candles from Meteora (`tools/meteora.js getDipFacts`: 1h candles of 3 days, plus 5m candles of 3 hours when the pool
+is near the zone) and `dipFromCandles` turns them into facts. A pool passes when price is
+`entryDipMinPct`–`entryDipMaxPct` below the highest candle body of the last `entryDipLookbackHours`, the last low is
+at least `entrySettleMinutes` old, price is `entrySettleBouncePct` off that low, and it is not more than
+`entryMaxFall3dPct` below its 3-day high. No Meteora candles → fallback facts from OKX's 24h high and the last step
+of the discovery `price_trend`. Neither → dropped (unless `failClosedOnMissingData` is off).
+`entryMode: "momentum"` keeps the old up/up filter.
+
+**Range — `checkDeploy`** (`strategy.rangeMode: "cover"`, the default):
 
 ```
-bins_below = round(35 + (volatility / 5) * 34), clamped to [35, 69]
+cover = coverMaxPct                                       if mcap < coverDeepBelowMcap, or mcap / volatility unknown
+      = coverMinPct + (min(volatility, 5) / 5) * (coverMaxPct - coverMinPct)   otherwise
+bins_below = ceil( ln(1 / (1 - cover/100)) / ln(1 + bin_step/10000) ), capped at maxBinsBelow
 ```
 
-- Low volatility (0) → 35 bins
-- High volatility (5+) → 69 bins
-- Any value in between is valid (continuous, not tiered)
+-60% at bin step 100 = 93 bins, -70% = 121, -70% at bin step 80 = 152. Anything above 69 bins goes through the
+wide-range path in `dlmm.js` (`createExtendedEmptyPosition` + `addLiquidityByStrategyChunkable`).
+A `bins_below` that comes through the model is ignored, in the autonomous cycles and in chat alike; only a range
+the owner types at the CLI (`--bins-below`) is kept. A hand-named pool gets its bin step and market cap from
+`getPoolFacts` and, with no volatility figure, `coverMaxPct`. `rangeMode: "bins"` is the old
+`round(35 + (volatility / 5) * 34)` clamp.
+
+**Exit — `checkBounceExit`**, called from `state.js updatePnlAndCheckExits` (30s poller and management cycle).
+`state.json` keeps `low_bin`, the lowest active bin seen since the open. depth = (top bin − low bin) / range
+width; bounce = `(1 + bin_step/10000)^(active − low) − 1`. depth ≥ `bounceExitMinDepthPct` and bounce ≥
+`bounceExitPct` (or `bounceExitDeepPct` once depth ≥ 75%) → `BOUNCE_EXIT`. Order of the exits: stop loss, bounce
+exit, trailing TP, out of range, low yield. Out-of-range waits: below the range `outOfRangeWaitMinutes` (30);
+above it `outOfRangeAboveWaitMinutes` (120), or `outOfRangeWaitMinutes` once price is more than
+`outOfRangeBinsToClose` bins above. More than `outOfRangeBinsToClose` bins BELOW the range still closes at once.
+`low_bin` only moves on two readings in a row, so one bad `active_bin` from the API cannot fake a deep dip.
+`takeProfitFeePct` is asked for by `setup.js` but no rule reads it: the only take-profit is the trailing one.
 
 ---
 

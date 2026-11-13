@@ -68,10 +68,13 @@ Runs one AI management cycle over open positions.
 Output: { done: true, report: "..." }
 \`\`\`
 
-### meridian deploy --pool <addr> --amount <sol> [--bins-below 69] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
+### meridian deploy --pool <addr> --amount <sol> [--bins-below N] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
 Deploys a new LP position. All safety checks apply.
+Without --bins-below the range is sized in code from the pool's bin step (read from Meteora): its bottom sits
+coverMaxPct (70%) below the entry price, the deep end, because a pool named by hand has no volatility figure.
+With --bins-below your number is used as typed (up to maxBinsBelow).
 \`\`\`
-Output: { success, position, pool_name, txs, price_range, bin_step }
+Output: { success, position, pool_name, txs, price_range, bin_step, bins_below, cover_pct }
 \`\`\`
 
 ### meridian claim --position <addr>
@@ -443,7 +446,7 @@ switch (subcommand) {
       bins_below: flags["bins-below"] ? parseInt(flags["bins-below"]) : undefined,
       bins_above: flags["bins-above"] ? parseInt(flags["bins-above"]) : undefined,
       allow_duplicate_pool: argv.includes("--allow-duplicate-pool"),
-    }));
+    }, { source: "human" }));
     break;
   }
 
@@ -462,7 +465,7 @@ switch (subcommand) {
     out(await executeTool("close_position", {
       position_address: flags.position,
       skip_swap: flags["skip-swap"] ?? false,
-    }));
+    }, { source: "human" }));
     break;
   }
 
@@ -474,12 +477,13 @@ switch (subcommand) {
       input_mint: flags.from,
       output_mint: flags.to,
       amount: parseFloat(flags.amount),
-    }));
+    }, { source: "human" }));
     break;
   }
 
   // ── screen ───────────────────────────────────────────────────────
   case "screen": {
+    process.env.MERIDIAN_NO_AUTOSTART = "1"; // one-shot run: do not boot the full agent on import
     const { runScreeningCycle } = await import("./index.js");
     const report = await runScreeningCycle({ silent });
     out({ done: true, report: report || "No action taken" });
@@ -488,6 +492,7 @@ switch (subcommand) {
 
   // ── manage ───────────────────────────────────────────────────────
   case "manage": {
+    process.env.MERIDIAN_NO_AUTOSTART = "1"; // one-shot run: do not boot the full agent on import
     const { runManagementCycle } = await import("./index.js");
     const report = await runManagementCycle({ silent });
     out({ done: true, report: report || "No action taken" });
@@ -524,9 +529,9 @@ switch (subcommand) {
 
   // ── start ────────────────────────────────────────────────────────
   case "start": {
-    const { startCronJobs } = await import("./index.js");
+    // index.js starts its own cycles, Telegram polling and REPL when it is loaded as the agent.
     process.stderr.write("[meridian] Starting autonomous agent...\n");
-    startCronJobs();
+    await import("./index.js");
     break;
   }
 
@@ -638,35 +643,13 @@ switch (subcommand) {
     break;
   }
 
-  // ── withdraw-liquidity ─────────────────────────────────────────
-  case "withdraw-liquidity": {
-    if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]");
-    if (!flags.pool) die("--pool is required");
-    const { withdrawLiquidity } = await import("./tools/dlmm.js");
-    out(await withdrawLiquidity({
-      position_address: flags.position,
-      pool_address: flags.pool,
-      bps: flags.bps ? parseInt(flags.bps) : 10000,
-      claim_fees: !argv.includes("--no-claim"),
-    }));
+  // ── withdraw-liquidity / add-liquidity ─────────────────────────
+  // These called withdrawLiquidity / addLiquidity, which tools/dlmm.js has never exported, so they crashed
+  // with "is not a function". Fail with a clear message until they are implemented.
+  case "withdraw-liquidity":
+  case "add-liquidity":
+    die(`${subcommand} is not implemented in this version. Use 'meridian close --position <addr>' to take liquidity out, or 'meridian deploy' to open a new position.`);
     break;
-  }
-
-  // ── add-liquidity ──────────────────────────────────────────────
-  case "add-liquidity": {
-    if (!flags.position) die("Usage: meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>]");
-    if (!flags.pool) die("--pool is required");
-    const { addLiquidity } = await import("./tools/dlmm.js");
-    out(await addLiquidity({
-      position_address: flags.position,
-      pool_address: flags.pool,
-      amount_x: flags["amount-x"] ? parseFloat(flags["amount-x"]) : 0,
-      amount_y: flags["amount-y"] ? parseFloat(flags["amount-y"]) : 0,
-      strategy: flags.strategy || "spot",
-      single_sided_x: argv.includes("--single-sided-x"),
-    }));
-    break;
-  }
 
   default:
     die(`Unknown command: ${subcommand}. Run 'meridian help' for usage.`);

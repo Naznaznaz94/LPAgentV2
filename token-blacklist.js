@@ -7,8 +7,12 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { dataFile } from "./paths.js";
 
-const BLACKLIST_FILE = "./token-blacklist.json";
+// Next to the code, not relative to the working directory (paths.js): started from elsewhere (global
+// `meridian` command, pm2 with another cwd) the list used to load empty without a word. A copy an older version
+// left in the working directory is still picked up.
+const BLACKLIST_FILE = dataFile("token-blacklist.json");
 
 function load() {
   if (!fs.existsSync(BLACKLIST_FILE)) return {};

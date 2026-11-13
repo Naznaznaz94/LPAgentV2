@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidates, getScreenedCandidate } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -9,10 +9,10 @@ import {
   closePosition,
   searchPools,
 } from "./dlmm.js";
-import { getWalletBalances, swapToken } from "./wallet.js";
+import { getWalletBalances, swapToken, normalizeMint } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, updateSignalSnapshot } from "../state.js";
+import { setPositionInstruction, updateSignalSnapshot, recordPendingSwap, clearPendingSwap } from "../state.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 
 import { getPoolMemory, addPoolNote, isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
@@ -21,7 +21,9 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds } from "../config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount } from "../config.js";
+import { checkDeploy, checkSwap, validateConfigChanges } from "../guards.js";
+import { getPoolFacts } from "./meteora.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -30,7 +32,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, sendMessage } from "../telegram.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -128,7 +130,16 @@ const toolMap = {
     }
     return { error: "invalid mode" };
   },
-  update_config: ({ changes, reason = "" }) => {
+  update_config: ({ changes, reason = "" } = {}, ctx = {}) => {
+    // Only a human-driven chat session may change config. The autonomous screening and management cycles
+    // (and anything injected into them) cannot widen their own limits.
+    if (ctx.agentType && ctx.agentType !== "GENERAL") {
+      log("safety_block", `update_config refused for ${ctx.agentType} cycle: ${JSON.stringify(changes)}`);
+      return { success: false, error: "update_config is only available in a chat session, not to the autonomous cycles." };
+    }
+    if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+      return { success: false, error: "changes must be an object of key → value" };
+    }
     // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
@@ -165,6 +176,7 @@ const toolMap = {
       poolCooldownHours:      ["management", "poolCooldownHours"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
+      minClaimAmountSol: ["management", "minClaimAmountSol"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
@@ -197,10 +209,31 @@ const toolMap = {
       maxSteps:        ["llm", "maxSteps"],
       // strategy
       strategy:  ["strategy", "strategy"],
+      rangeMode: ["strategy", "rangeMode"],
+      coverMinPct: ["strategy", "coverMinPct"],
+      coverMaxPct: ["strategy", "coverMaxPct"],
+      coverDeepBelowMcap: ["strategy", "coverDeepBelowMcap"],
+      maxBinsBelow: ["strategy", "maxBinsBelow"],
       binsBelow: ["strategy", "binsBelow"],
+      minBinsBelow: ["strategy", "minBinsBelow"],
+      // entry timing
+      entryMode:             ["screening", "entryMode"],
+      entryDipMinPct:        ["screening", "entryDipMinPct"],
+      entryDipMaxPct:        ["screening", "entryDipMaxPct"],
+      entryDipLookbackHours: ["screening", "entryDipLookbackHours"],
+      entrySettleMinutes:    ["screening", "entrySettleMinutes"],
+      entrySettleBouncePct:  ["screening", "entrySettleBouncePct"],
+      entryMaxFall3dPct:     ["screening", "entryMaxFall3dPct"],
+      // exits added with the pullback entry
+      outOfRangeAboveWaitMinutes: ["management", "outOfRangeAboveWaitMinutes"],
+      bounceExit:            ["management", "bounceExit"],
+      bounceExitMinDepthPct: ["management", "bounceExitMinDepthPct"],
+      bounceExitPct:         ["management", "bounceExitPct"],
+      bounceExitDeepPct:     ["management", "bounceExitDeepPct"],
+      maxSwapPriceImpactPct: ["risk", "maxSwapPriceImpactPct"],
     };
 
-    const applied = {};
+    const requested = {};
     const unknown = [];
 
     // Build case-insensitive lookup
@@ -211,12 +244,19 @@ const toolMap = {
     for (const [key, val] of Object.entries(changes)) {
       const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
       if (!match) { unknown.push(key); continue; }
-      applied[match[0]] = val;
+      requested[match[0]] = val;
+    }
+
+    // Type and range check every value (guards.js CONFIG_BOUNDS). Out-of-range values are rejected, not clamped.
+    const current = Object.fromEntries(Object.entries(CONFIG_MAP).map(([k, [section, field]]) => [k, config[section][field]]));
+    const { applied, rejected } = validateConfigChanges(requested, current);
+    if (Object.keys(rejected).length > 0) {
+      log("config", `update_config rejected: ${JSON.stringify(rejected)}`);
     }
 
     if (Object.keys(applied).length === 0) {
-      log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
-      return { success: false, unknown, reason };
+      log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, rejected: ${JSON.stringify(rejected)}, raw changes: ${JSON.stringify(changes)}`);
+      return { success: false, unknown, rejected, reason };
     }
 
     // Apply to live config immediately
@@ -255,7 +295,7 @@ const toolMap = {
     }
 
     log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);
-    return { success: true, applied, unknown, reason };
+    return { success: true, applied, unknown, rejected, reason };
   },
 };
 
@@ -274,8 +314,11 @@ const PROTECTED_TOOLS = new Set([
 /**
  * Execute a tool call with safety checks and logging.
  */
-export async function executeTool(name, args) {
+export async function executeTool(name, args, ctx = {}) {
+  // ctx = { agentType, source }: who is asking. agentType is the LLM role (SCREENER / MANAGER / GENERAL);
+  // source "rule" = a deterministic exit rule in index.js, "human" = a direct Telegram / CLI command.
   const startTime = Date.now();
+  args = args && typeof args === "object" ? args : {};
 
   // Strip model artifacts like "<|channel|>commentary" appended to tool names
   name = name.replace(/<.*$/, "").trim();
@@ -290,7 +333,7 @@ export async function executeTool(name, args) {
 
   // ─── Pre-execution safety checks ──────────
   if (PROTECTED_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args);
+    const safetyCheck = await runSafetyChecks(name, args, ctx);
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -302,7 +345,7 @@ export async function executeTool(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
-    const result = await fn(args);
+    const result = await fn(args, ctx);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
@@ -314,8 +357,11 @@ export async function executeTool(name, args) {
       success,
     });
 
-    if (success) {
+    // A dry run sent nothing: no "Deployed" / "Closed" message, no signals attached, no swap to follow up.
+    // (Telegram used to say "Closed … +$0.00" for every simulated close.)
+    if (success && !result?.dry_run) {
       if (name === "swap_token" && result.tx) {
+        if (normalizeMint(args.output_mint) === config.tokens.SOL) clearPendingSwap(normalizeMint(args.input_mint));
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
@@ -333,19 +379,41 @@ export async function executeTool(name, args) {
         }
         // Auto-swap base token back to SOL unless user said to hold
         if (!args.skip_swap && result.base_mint) {
+          const sym = result.base_mint.slice(0, 8);
+          const swapFailed = (why) => {
+            // Say what really happened: the bag is still in the wallet. (This used to report "already swapped".)
+            result.auto_swapped = false;
+            result.auto_swap_error = why;
+            result.auto_swap_note = `Auto-swap of the leftover ${sym} back to SOL FAILED (${why}). The tokens are still in the wallet; the swap is retried on the next management checks.`;
+            log("executor_warn", `Auto-swap after close failed: ${why}`);
+            // Remember it: index.js retries on every management check until it goes through or gives up.
+            recordPendingSwap(result.base_mint, { pool_name: result.pool_name || null, error: why });
+            sendMessage(`⚠️ Closed ${result.pool_name || sym}, but the leftover tokens were NOT swapped to SOL: ${why}. They are still in the wallet. The swap will be retried on the next checks; sell by hand if you do not want to wait.`).catch(() => {});
+          };
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
-            if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
+            // Helius has no price for many new or dumped tokens (usd = null). That is not a reason to keep the bag.
+            if (token && token.balance > 0 && (token.usd == null || token.usd >= 0.10)) {
+              log("executor", `Auto-swapping ${token.symbol || sym} (${token.usd != null ? "$" + token.usd.toFixed(2) : "no price"}) back to SOL`);
               const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
-              // Tell the model the swap already happened so it doesn't call swap_token again
-              result.auto_swapped = true;
-              result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-              if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+              if (swapResult?.success === false) {
+                swapFailed(swapResult.error || "swap failed");
+              } else {
+                // Tell the model the swap already happened so it doesn't call swap_token again
+                result.auto_swapped = true;
+                result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || sym} → SOL). Do NOT call swap_token again.`;
+                if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+              }
+            } else if (balances.error) {
+              swapFailed(`wallet balance could not be read (${balances.error})`);
+            } else if (!token || !(token.balance > 0)) {
+              // Not in the balance list. Either the position held no tokens, or the balance API has not caught
+              // up with the close yet. Do not assume the first: the management cycle looks again (3 times).
+              recordPendingSwap(result.base_mint, { pool_name: result.pool_name || null, error: "not in the wallet balance list right after the close" });
             }
           } catch (e) {
-            log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+            swapFailed(e.message);
           }
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
@@ -385,51 +453,54 @@ export async function executeTool(name, args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+async function runSafetyChecks(name, args, ctx = {}) {
   switch (name) {
     case "deploy_position": {
-      // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
-      if (args.bin_step == null) {
-        log("safety_warn", `deploy_position called without bin_step — SDK will pick pool default which may not match config range [${minStep}-${maxStep}]. Always pass bin_step explicitly.`);
-      } else if (args.bin_step < minStep || args.bin_step > maxStep) {
-        return {
-          pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
-        };
-      }
-
-      // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
+      // All the yes/no logic is in guards.js checkDeploy (unit-tested). Here we only gather the facts.
       const positions = await getMyPositions({ force: true });
-      if (positions.total_positions >= config.risk.maxPositions) {
-        return {
-          pass: false,
-          reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
-        };
-      }
-      const alreadyInPool = positions.positions.some(
-        (p) => p.pool === args.pool_address
-      );
-      if (alreadyInPool) {
-        return {
-          pass: false,
-          reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
-        };
-      }
-
-      // Block same base token across different pools
-      if (args.base_mint) {
-        const alreadyHasMint = positions.positions.some(
-          (p) => p.base_mint === args.base_mint
-        );
-        if (alreadyHasMint) {
-          return {
-            pass: false,
-            reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
-          };
+      let balance = null;
+      if (process.env.DRY_RUN !== "true") {
+        balance = await getWalletBalances();
+        if (balance.error) {
+          return { pass: false, reason: `Wallet balance could not be read (${balance.error}). Not deploying blind.` };
         }
       }
+      args.pool_address = normalizeMint(args.pool_address);
+      // A deploy typed by the owner (cli.js) may name any pool and any size up to maxDeployAmount; everything
+      // that comes through the model is tied to the screening result and to the computed position size.
+      const human = ctx.source === "human";
+      const requireScreened = !human && config.risk.allowUnscreenedDeploy !== true;
+      let candidate = getScreenedCandidate(args.pool_address);
+      if (!candidate && !requireScreened) {
+        // A pool named by hand has no screening record. Read its bin step, market cap and base mint from
+        // Meteora's pool record so the range can still be sized in code.
+        try {
+          const facts = await getPoolFacts(args.pool_address);
+          if (facts.is_blacklisted) {
+            return { pass: false, reason: `Pool ${args.pool_address} is blacklisted by Meteora.` };
+          }
+          candidate = facts;
+        } catch (e) {
+          log("executor_warn", `Pool record unavailable for ${args.pool_address}: ${e.message}`);
+        }
+      }
+      const verdict = checkDeploy({
+        args,
+        candidate,
+        cfg: config,
+        openPositions: positions.unknown ? null : positions.positions,
+        sizeCapSol: balance && !human ? computeDeployAmount(balance.sol) : null,
+        requireScreened,
+        // Only a range the owner typed himself at the CLI is kept as typed. Anything that reaches here through
+        // the model (the autonomous cycles, and chat too) is sized in code: a chat message is turned into
+        // arguments by the model, which could just as well invent a shallow range nobody asked for. To use a
+        // different range from chat, change coverMinPct / coverMaxPct with update_config first.
+        ownerRange: human,
+      });
+      if (!verdict.pass) return verdict;
+      // Use the checked arguments from here on: bin step and base mint from the screening record, bins below
+      // computed in code, SOL-only unless allowTwoSided.
+      Object.assign(args, verdict.args);
 
       // Cooldown check — block re-entry into pools/tokens that are on cooldown
       if (isPoolOnCooldown(args.pool_address)) {
@@ -445,38 +516,13 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check amount limits
-      const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      if (amountY <= 0) {
-        return {
-          pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
-        };
-      }
-
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
-        return {
-          pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
-        };
-      }
-      if (amountY > config.risk.maxDeployAmount) {
-        return {
-          pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
-        };
-      }
-
-      // Check SOL balance
-      if (process.env.DRY_RUN !== "true") {
-        const balance = await getWalletBalances();
+      if (balance) {
         const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
+        const minRequired = args.amount_y + gasReserve;
         if (balance.sol < minRequired) {
           return {
             pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${args.amount_y} deploy + ${gasReserve} gas reserve).`,
           };
         }
       }
@@ -485,9 +531,15 @@ async function runSafetyChecks(name, args) {
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
-      return { pass: true };
+      // Selling a token for SOL always passes. Buying a token needs allowTwoSided, a size cap and the gas reserve.
+      const input = normalizeMint(args.input_mint);
+      const output = normalizeMint(args.output_mint);
+      let solBalance = null;
+      if (input === config.tokens.SOL && process.env.DRY_RUN !== "true") {
+        const balance = await getWalletBalances();
+        solBalance = balance.error ? 0 : balance.sol;
+      }
+      return checkSwap({ args: { ...args, input_mint: input, output_mint: output }, cfg: config, solMint: config.tokens.SOL, solBalance });
     }
 
     case "self_update": {

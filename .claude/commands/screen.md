@@ -19,8 +19,9 @@ If no pending signals: proceed with normal cycle (Steps 1–6 as written).
 
 **Step 1 — Read config:**
 ```
-cat user-config.json
+node cli.js config get
 ```
+(Do not `cat user-config.json`: it can hold the wallet key and API keys, and would print them into the chat.)
 Note `deployAmountSol`, `gasReserve`, and `maxPositions`. Minimum wallet needed = deployAmountSol + gasReserve.
 
 **Step 2 — Wallet balance:**
