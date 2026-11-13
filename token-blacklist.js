@@ -6,9 +6,13 @@
  */
 
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
-const BLACKLIST_FILE = "./token-blacklist.json";
+// Next to this file, not relative to the working directory: started from elsewhere (global `meridian` command,
+// pm2 with another cwd) the list used to load empty without a word.
+const BLACKLIST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "token-blacklist.json");
 
 function load() {
   if (!fs.existsSync(BLACKLIST_FILE)) return {};

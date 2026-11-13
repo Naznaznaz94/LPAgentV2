@@ -7,9 +7,13 @@
  */
 
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
-const BLOCKLIST_FILE = "./dev-blocklist.json";
+// Next to this file, not relative to the working directory: started from elsewhere (global `meridian` command,
+// pm2 with another cwd) the list used to load empty without a word.
+const BLOCKLIST_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "dev-blocklist.json");
 
 function load() {
   if (!fs.existsSync(BLOCKLIST_FILE)) return {};

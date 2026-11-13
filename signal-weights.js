@@ -10,9 +10,13 @@
  */
 
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
-const WEIGHTS_FILE = "./signal-weights.json";
+// Next to this file, not relative to the working directory: started from elsewhere (global `meridian` command,
+// pm2 with another cwd) the list used to load empty without a word.
+const WEIGHTS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "signal-weights.json");
 
 // ─── Signal Definitions ─────────────────────────────────────────
 

@@ -176,11 +176,17 @@ export async function getPriceInfo(tokenAddress, chainIndex = CHAIN_SOLANA) {
   if (!d) return null;
   const price    = parseFloat(d.price    || 0);
   const maxPrice = parseFloat(d.maxPrice || 0);
+  const vsHigh = maxPrice > 0 ? parseFloat(((price / maxPrice) * 100).toFixed(1)) : null;
   return {
     price,
+    // OKX documents maxPrice / minPrice on this endpoint as the 24-HOUR high and low, not all-time values:
+    // a token 90% below its real top reads "100%" here when it sits at today's high.
+    high_24h:              maxPrice,
+    price_vs_24h_high_pct: vsHigh,
+    // Old names, kept because config keys (athFilterPct, minAthPct) and stored signals use them. Same numbers.
     ath:              maxPrice,
     atl:              parseFloat(d.minPrice || 0),
-    price_vs_ath_pct: maxPrice > 0 ? parseFloat(((price / maxPrice) * 100).toFixed(1)) : null,
+    price_vs_ath_pct: vsHigh,
     price_change_5m:  pct(d.priceChange5M),
     price_change_1h:  pct(d.priceChange1H),
     volume_5m:        pct(d.volume5M),

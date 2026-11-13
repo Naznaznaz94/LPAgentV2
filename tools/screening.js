@@ -221,11 +221,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   //       = [n-1] > [n-2]  AND  [n-2] < [n-3]  AND  [n-3] > [n-4]           → up, down, up
   //
   // If fewer than 3 valid data points exist, we can't verify the pattern → pass (no data).
+  // failClosedOnMissingData (default on): a check that cannot run for lack of data drops the candidate. These
+  // used to pass on "no data", so an OKX or price-feed outage switched the safety filters off.
+  const failClosed = config.screening.failClosedOnMissingData !== false;
   eligible.splice(0, eligible.length, ...eligible.filter((p) => {
     const trend = p.price_trend;
-    if (!Array.isArray(trend) || trend.length < 3) return true; // no data → pass
-    const valid = trend.filter(v => v > 0); // strip -1.0 placeholder values
-    if (valid.length < 3) return true; // need at least 3 points
+    const valid = Array.isArray(trend) ? trend.filter(v => v > 0) : []; // strip -1.0 placeholder values
+    if (valid.length < 3) { // need at least 3 points to see a pattern
+      if (!failClosed) return true;
+      pushFilteredReason(filteredOut, p, "price direction: not enough price points to check the entry pattern");
+      return false;
+    }
 
     const n = valid.length;
 
@@ -293,6 +299,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].dex_boost       = adv.dex_boost;
         eligible[i].dex_screener_paid = adv.dex_screener_paid;
         eligible[i].fees_sol        = adv.total_fee_sol;   // lifetime fees in SOL — enforces minTokenFeesSol hard rule
+        eligible[i].is_honeypot     = adv.is_honeypot;     // these three were fetched and then dropped
+        eligible[i].dev_rug_count   = adv.dev_rug_count;
+        eligible[i].lp_burned_pct   = adv.lp_burned_pct;
         if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
       }
       if (risk) {
@@ -310,13 +319,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
       }
     }
-    // Wash trading hard filter — fake volume = misleading fee yield
+    // Hard risk filters, in code. Wash trading = fake volume. A liquidity-removal (rug) flag and a honeypot tag
+    // were only shown to the model before, with a prompt line that let "smart wallets" override a rug flag.
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-      if (p.is_wash) {
-        log("screening", `Risk filter: dropped ${p.name} — wash trading flagged`);
-        pushFilteredReason(filteredOut, p, "wash trading flagged");
+      const drop = (why) => {
+        log("screening", `Risk filter: dropped ${p.name} — ${why}`);
+        pushFilteredReason(filteredOut, p, why);
         return false;
-      }
+      };
+      if (p.is_wash) return drop("wash trading flagged");
+      if (p.is_rugpull) return drop("liquidity-removal (rug) flag");
+      if (p.is_honeypot) return drop("honeypot tag");
+      if (failClosed && (p.is_wash == null || p.bundle_pct == null)) return drop("no OKX risk data for this token (failClosedOnMissingData)");
       return true;
     }));
 
@@ -338,7 +352,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const minFeesSol = config.screening.minTokenFeesSol;
     if (minFeesSol != null) {
       eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-        if (p.fees_sol == null) return true; // no OKX data → pass
+        if (p.fees_sol == null) { // no OKX data
+          if (!failClosed) return true;
+          pushFilteredReason(filteredOut, p, "lifetime fees unknown (failClosedOnMissingData)");
+          return false;
+        }
         if (p.fees_sol < minFeesSol) {
           log("screening", `Token fees filter: dropped ${p.name} — ${p.fees_sol.toFixed(1)} SOL lifetime fees < min ${minFeesSol}`);
           pushFilteredReason(filteredOut, p, `${p.fees_sol.toFixed(1)} SOL lifetime fees below min ${minFeesSol}`);

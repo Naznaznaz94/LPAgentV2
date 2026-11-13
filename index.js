@@ -542,6 +542,28 @@ export async function runScreeningCycle({ silent = false } = {}) {
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
         return false;
       }
+      // Token audit checks that were fetched but never enforced: mint / freeze authority and top-10 holders.
+      const drop = (reason) => {
+        log("screening", `Audit filter: dropped ${pool.name} — ${reason}`);
+        filteredOut.push({ name: pool.name, reason });
+        return false;
+      };
+      const audit = ti?.audit;
+      const failClosed = config.screening.failClosedOnMissingData !== false;
+      if (!audit) {
+        if (failClosed) return drop("no token audit data (failClosedOnMissingData)");
+        return true;
+      }
+      if (config.screening.requireRenouncedAuthorities !== false) {
+        if (audit.mint_disabled === false) return drop("mint authority is still active (supply can be inflated)");
+        if (audit.freeze_disabled === false) return drop("freeze authority is still active (your tokens can be frozen)");
+        if (failClosed && (audit.mint_disabled == null || audit.freeze_disabled == null)) return drop("mint / freeze authority unknown (failClosedOnMissingData)");
+      }
+      const top10 = parseFloat(audit.top_holders_pct);
+      const maxTop10 = config.screening.maxTop10Pct;
+      if (maxTop10 != null && Number.isFinite(top10) && top10 > maxTop10) {
+        return drop(`top-10 holders ${top10}% > ${maxTop10}%`);
+      }
       return true;
     });
 

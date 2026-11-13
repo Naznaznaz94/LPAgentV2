@@ -42,7 +42,7 @@ function save(data) {
 
 function isOorCloseReason(reason) {
   const text = String(reason || "").trim().toLowerCase();
-  return text === "oor" || text.includes("out of range") || text.includes("oor");
+  return text.includes("out of range") || /\boor\b/.test(text); // \b: "poor yield" is not an OOR close
 }
 
 function isAdjustedWinRateExcludedReason(reason) {

@@ -966,8 +966,9 @@ export async function closePosition({ position_address, reason }) {
           feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
           initialUsd    = tracked.initial_value_usd || 0;
           if (initialUsd > 0) {
-            // PnL already includes fees — do NOT subtract feesUsd again (double-counting)
-            finalValueUsd = Math.max(0, initialUsd + pnlUsd);
+            // recordPerformance computes pnl = final + fees - initial. pnlUsd here already includes the fees, so
+            // the "final value" handed over must be net of them, or the fees are counted twice.
+            finalValueUsd = Math.max(0, initialUsd + pnlUsd - feesUsd);
             pnlPct = (pnlUsd / initialUsd) * 100;
           } else {
             finalValueUsd = cachedPos.total_value_true_usd ?? cachedPos.total_value_usd ?? 0;

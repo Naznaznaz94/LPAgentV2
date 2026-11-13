@@ -92,6 +92,11 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
 
+**Hard bounds:** every key above is type- and range-checked in `guards.js` (`CONFIG_BOUNDS`) before it is applied,
+and `update_config` is refused for the autonomous SCREENER / MANAGER cycles (chat sessions only). The safety
+switches `allowTwoSided`, `allowUnscreenedDeploy`, `requireRenouncedAuthorities` and `failClosedOnMissingData`
+live in `user-config.json` only and are not reachable through `update_config`.
+
 **`computeDeployAmount(walletSol)`** — scales position size with wallet balance (compounding). Formula: `clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)`.
 
 ---
@@ -100,12 +105,19 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 
 1. **Deploy**: `deploy_position` → executor safety checks → `trackPosition()` in state.js → Telegram notify
 2. **Monitor**: management cron → `getMyPositions()` → `getPositionPnl()` → OOR detection → pool-memory snapshots
-3. **Close**: `close_position` → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
+3. **Close**: decided by the deterministic rules in `runManagementCycle` and executed in code via `executeTool("close_position", …, { source: "rule" })` (the LLM is only consulted for positions with an owner instruction) → `recordPerformance()` in lessons.js → auto-swap base token to SOL → Telegram notify
 4. **Learn**: `evolveThresholds()` runs on performance data → updates config.screening → persists to user-config.json
 
 ---
 
-## Screener Safety Checks (executor.js)
+## Screener Safety Checks (executor.js → guards.js `checkDeploy`)
+
+All yes/no logic lives in `guards.js` (pure, unit-tested: `npm run test:guards`). The executor gathers the facts
+(open positions, wallet balance, the pool's record from the latest screening run) and applies the verdict.
+A positions-API failure is `unknown: true` and blocks the deploy; it is never treated as "no positions".
+The pool must be in the latest screening result unless the deploy was typed by the owner at the CLI or
+`allowUnscreenedDeploy` is set. `bins_below` is computed in code from volatility. Positions are SOL-only unless
+`allowTwoSided` is set.
 
 Before `deploy_position` executes:
 - `bin_step` must be within `[minBinStep, maxBinStep]`

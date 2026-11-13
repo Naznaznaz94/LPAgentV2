@@ -54,8 +54,13 @@ function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
     const tmp = `${STATE_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_FILE);
+    const body = JSON.stringify(state, null, 2);
+    fs.writeFileSync(tmp, body);
+    try {
+      fs.renameSync(tmp, STATE_FILE);
+    } catch {
+      fs.writeFileSync(STATE_FILE, body); // e.g. Windows: target briefly locked by another process
+    }
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }

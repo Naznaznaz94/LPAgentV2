@@ -75,10 +75,15 @@ WALLET_PRIVATE_KEY=your_base58_private_key
 RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 OPENROUTER_API_KEY=sk-or-...
 HELIUS_API_KEY=your_helius_key          # for wallet balance lookups
+JUPITER_API_KEY=your_jupiter_key        # for swaps and prices (no longer hard-coded in the source)
 TELEGRAM_BOT_TOKEN=123456:ABC...        # optional — for notifications + chat
 TELEGRAM_CHAT_ID=                       # auto-filled on first message
 DRY_RUN=true                            # set false for live trading
 ```
+
+Dry run is **on if either** `DRY_RUN` in `.env` **or** `"dryRun": true` in `user-config.json` asks for it. To go
+live, both must say so (`DRY_RUN=false` and `"dryRun": false`, or leave one of them out). Any other value of
+`DRY_RUN` (`1`, `True`, a typo) counts as dry run.
 
 > Never put your private key or API keys in `user-config.json` — use `.env` only. Both files are gitignored.
 
@@ -406,7 +411,36 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
 | `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
-| `stopLossPct` | `-15` | Close position if price drops by this % |
+| `stopLossPct` | `-15` | Close the position when its PnL falls to this % |
+| `minClaimAmountSol` | `0.05` | Claim threshold in SOL, used when `solMode` is on (`minClaimAmount` is USD) |
+| `minBinsBelow` | `35` | Narrowest range (bins below price), used at volatility 0; `binsBelow` is the widest |
+
+### Safety switches
+
+These are read from `user-config.json` only. The agent cannot change them through `update_config`.
+
+| Field | Default | Description |
+|---|---|---|
+| `allowTwoSided` | `false` | `false` = SOL-only positions: `amount_x`, `bins_above` and SOL → token swaps are refused in code |
+| `allowUnscreenedDeploy` | `false` | `false` = the model can only deploy into a pool from the latest screening result. Deploys you type yourself with `node cli.js deploy` may name any pool |
+| `maxSwapPriceImpactPct` | `15` | A swap quoted above this price impact is refused; the tokens stay in the wallet and you get a Telegram alert |
+| `requireRenouncedAuthorities` | `true` | Drop tokens whose mint or freeze authority is still active |
+| `failClosedOnMissingData` | `true` | A token with no audit / OKX risk data / price points is dropped. Set `false` to let "no data" pass, as before |
+
+### What is enforced in code (not by the prompt)
+
+- **Exits.** Stop loss, trailing take-profit, out-of-range and low-yield closes are executed directly by `index.js`.
+  The model is only asked about positions that carry your own instruction (`/set <n> <note>`). A model outage
+  cannot stop a stop loss; a close that fails raises a Telegram alert and is retried.
+- **API failures.** If the positions API fails, the cycle is skipped and reported. It is never read as "no positions".
+- **Deploys.** Pool must be screened; bin step and base token come from the screening record and the on-chain
+  pool; `bins_below` is computed from volatility; size is capped at `positionSizePct` of the wallet and
+  `maxDeployAmount`; one position per token.
+- **Config.** `update_config` works in chat sessions only (not in the autonomous cycles) and every value is type-
+  and range-checked (`guards.js`, `CONFIG_BOUNDS`).
+- **Tools per role.** The screener, manager and health-check roles can only call the tools they are shown.
+
+`npm run test:guards` runs the unit tests for these checks (no network, no wallet).
 
 ### Schedule
 

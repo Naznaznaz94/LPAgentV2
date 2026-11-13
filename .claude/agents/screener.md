@@ -95,9 +95,14 @@ Use the gathered data to match a strategy:
 
 Each strategy uses the gathered data differently. After choosing a strategy, follow its specific deploy logic.
 
+**Default is SOL-only.** The executor refuses `amount_x` / `bins_above` and SOL → token swaps unless
+`allowTwoSided` is set to `true` in `user-config.json`. Every two-sided strategy below starts with part of the
+capital in the token, so it carries the token's price risk from the first minute. Use them only when the owner
+has switched that on.
+
 **Critical DLMM bin mechanics — never get this wrong:**
-- Bins BELOW active bin = hold token X (base token). Token goes here NATURALLY with amount_x, no flag needed.
-- Bins ABOVE active bin = hold token Y (SOL). SOL goes here NATURALLY with amount_y.
+- Bins BELOW the active bin hold token Y (SOL): that is where `amount_y` goes. They buy the token as price falls.
+- Bins ABOVE the active bin hold token X (the base token): that is where `amount_x` goes. They sell it as price rises.
 - `--single-sided-x` = override: forces token X onto bins ABOVE active (ask side = sell wall on pump). ONLY use this when you specifically want token on the upside.
 - Two-step deploy: Step 1 fills both sides naturally. Step 2 uses `--single-sided-x` to ADD token to the upside bins on top of the SOL already there.
 
@@ -295,7 +300,7 @@ Only consider adding a layer when data from `pool-detail`, `token-info`, and `st
 ### 4. Pre-Deploy Checks & Capital Allocation (ALL strategies)
 
 Before ANY deploy:
-1. `cat user-config.json` — read gasReserve, positionSizePct, maxDeployAmount
+1. `node cli.js config get` — read gasReserve, positionSizePct, maxDeployAmount (do NOT `cat user-config.json`: it can hold the wallet key and API keys)
 2. `node cli.js balance` — get wallet SOL
 3. `node cli.js blacklist list` — confirm token not blacklisted
 4. Calculate total capital: `total_sol = min((wallet_sol - gasReserve) × positionSizePct, maxDeployAmount)`
