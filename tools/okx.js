@@ -1,5 +1,13 @@
 /**
- * OKX DEX API helpers — public endpoints (no API key required)
+ * OKX DEX API helpers.
+ *
+ * Checked 2026-11-13: without OKX API keys only the risk check (getRiskFlags: wash trading, liquidity
+ * removal) still answers. advanced-info, price-info and cluster-list return HTTP 402 (pay per call). The
+ * screening falls back to Jupiter's figures for bundler holdings and lifetime fees, and to Meteora's candles
+ * for the pullback. With OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE (/ OKX_PROJECT_ID) in .env the signed
+ * requests below are used instead; whether those endpoints are free with a key was not checked.
+ *
+ * Original note: public endpoints (no API key required)
  * Uses Ok-Access-Client-type: agent-cli header for unauthenticated access.
  * Docs: https://web3.okx.com/build/dev-docs/
  */

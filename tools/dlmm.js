@@ -82,7 +82,9 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+// unref: this timer alone must not keep the process alive, or every one-shot CLI command (candidates, deploy,
+// close…) hangs after printing its result.
+setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref();
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {

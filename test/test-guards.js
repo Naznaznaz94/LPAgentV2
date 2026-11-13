@@ -302,3 +302,19 @@ test("update_config: the new keys are bounded and kept in order", () => {
   assert.deepEqual(validateConfigChanges({ entryDipMinPct: 15, coverMaxPct: 75, entryMaxFall3dPct: null }, cur).applied,
     { entryDipMinPct: 15, coverMaxPct: 75, entryMaxFall3dPct: null });
 });
+
+test("token audit: bundle and lifetime fees from OKX when it has them, else from Jupiter", () => {
+  const s = { failClosedOnMissingData: true, requireRenouncedAuthorities: true, maxBotHoldersPct: 30, maxTop10Pct: 60, maxBundlePct: 30, minTokenFeesSol: 30 };
+  const tok = { global_fees_sol: 120, audit: { mint_disabled: true, freeze_disabled: true, top_holders_pct: "20", bot_holders_pct: "5", bundle_pct: 1.8 } };
+  const r = checkTokenAudit({ token: tok, screening: s, okx: { bundle_pct: null, fees_sol: null } });
+  assert.equal(r.pass, true);
+  assert.equal(r.bundle_pct, 1.8);                     // Jupiter's figure
+  assert.equal(r.fees_sol, 120);
+  assert.equal(checkTokenAudit({ token: tok, screening: s, okx: { bundle_pct: 45, fees_sol: 500 } }).pass, false); // OKX's wins
+  assert.match(checkTokenAudit({ token: { ...tok, global_fees_sol: 12 }, screening: s }).reason, /lifetime fees below/);
+  assert.match(checkTokenAudit({ token: { ...tok, audit: { ...tok.audit, bundle_pct: 40 } }, screening: s }).reason, /bundlers hold 40%/);
+  const noBundle = checkTokenAudit({ token: { ...tok, audit: { ...tok.audit, bundle_pct: null } }, screening: s });
+  assert.equal(noBundle.pass, false);
+  assert.equal(noBundle.missing, true);
+  assert.equal(checkTokenAudit({ token: { ...tok, global_fees_sol: null }, screening: { ...s, failClosedOnMissingData: false } }).pass, true);
+});

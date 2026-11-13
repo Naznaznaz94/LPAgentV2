@@ -481,8 +481,12 @@ These are read from `user-config.json` only. The agent cannot change them throug
 - **Leftover tokens.** If the swap back to SOL after a close fails (no route, price impact above the limit,
   Jupiter down), the token is remembered and the swap is retried on every management check, up to 12 times.
   After that you get a Telegram alert and the tokens stay in the wallet for you to sell.
-- **Data outages.** When OKX or the Jupiter audit has no data for any candidate, nothing can pass the screen. The
-  screening report and a Telegram alert say so, so it is not mistaken for a quiet market.
+- **Data outages.** When OKX's risk check or the Jupiter audit has no data for any candidate, nothing can pass the
+  screen. The screening report and a Telegram alert say so, so it is not mistaken for a quiet market.
+- **OKX went paid (Nov 2026).** Without OKX API keys only its risk check (wash trading, liquidity removal) still
+  answers. Bundler holdings and lifetime fees are then taken from Jupiter's token data (same meaning, free), and
+  the pullback from Meteora's candles. Add `OKX_API_KEY`, `OKX_SECRET_KEY`, `OKX_PASSPHRASE` to `.env` to use
+  OKX's figures again.
 - **Dry run.** A simulated close or deploy sends no "Closed" / "Deployed" message and is repeated at most once
   an hour. The startup line says which of the two switches turned dry run on.
 

@@ -373,9 +373,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (p.is_rugpull) return drop("liquidity-removal (rug) flag");
       if (p.is_honeypot) return drop("honeypot tag");
       gaps.okx.checked += 1;
-      if (p.is_wash == null || p.bundle_pct == null) {
+      // Only the free risk check is required here (wash trading / liquidity removal). Bundler holdings and
+      // lifetime fees are checked with the token audit below, from OKX when it has them, otherwise from Jupiter.
+      if (p.is_wash == null) {
         gaps.okx.missing += 1;
-        if (failClosed) return drop("no OKX risk data for this token (failClosedOnMissingData)");
+        if (failClosed) return drop("no OKX risk check for this token (failClosedOnMissingData)");
       }
       return true;
     }));
@@ -384,7 +386,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const maxBundle = config.screening.maxBundlePct;
     if (maxBundle != null) {
       eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-        if (p.bundle_pct == null) return true; // no OKX data → pass
+        if (p.bundle_pct == null) return true; // no OKX figure: checked against Jupiter's with the token audit
         if (p.bundle_pct > maxBundle) {
           log("screening", `Bundle filter: dropped ${p.name} — ${p.bundle_pct}% bundle > max ${maxBundle}%`);
           pushFilteredReason(filteredOut, p, `${p.bundle_pct}% bundle above max ${maxBundle}%`);
@@ -398,11 +400,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const minFeesSol = config.screening.minTokenFeesSol;
     if (minFeesSol != null) {
       eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-        if (p.fees_sol == null) { // no OKX data
-          if (!failClosed) return true;
-          pushFilteredReason(filteredOut, p, "lifetime fees unknown (failClosedOnMissingData)");
-          return false;
-        }
+        if (p.fees_sol == null) return true; // no OKX figure: checked against Jupiter's with the token audit
         if (p.fees_sol < minFeesSol) {
           log("screening", `Token fees filter: dropped ${p.name} — ${p.fees_sol.toFixed(1)} SOL lifetime fees < min ${minFeesSol}`);
           pushFilteredReason(filteredOut, p, `${p.fees_sol.toFixed(1)} SOL lifetime fees below min ${minFeesSol}`);
@@ -483,13 +481,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       await new Promise((r) => setTimeout(r, 150)); // avoid 429s
     }
     gaps.audit.checked += 1;
-    const verdict = checkTokenAudit({ token, screening: config.screening });
+    const verdict = checkTokenAudit({ token, screening: config.screening, okx: { bundle_pct: p.bundle_pct, fees_sol: p.fees_sol } });
     if (!verdict.pass) {
       if (verdict.missing) gaps.audit.missing += 1;
       log("screening", `Audit filter: dropped ${p.name} — ${verdict.reason}`);
       pushFilteredReason(filteredOut, p, verdict.reason);
       continue;
     }
+    p.bundle_pct = verdict.bundle_pct ?? p.bundle_pct ?? null; // shown to the model: whichever source answered
+    p.fees_sol = verdict.fees_sol ?? p.fees_sol ?? null;
     // Kept small on purpose: this object goes to the model with the candidate.
     p.token = token
       ? { launchpad: token.launchpad ?? null, global_fees_sol: token.global_fees_sol ?? null, audit: token.audit ?? null, stats_1h: token.stats_1h ?? null }
@@ -502,7 +502,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   rememberScreened(eligible);
 
   const down = [];
-  if (failClosed && gaps.okx.checked >= 3 && gaps.okx.missing === gaps.okx.checked) down.push(`OKX risk data was unavailable for all ${gaps.okx.checked} candidates checked`);
+  if (failClosed && gaps.okx.checked >= 3 && gaps.okx.missing === gaps.okx.checked) down.push(`OKX's risk check was unavailable for all ${gaps.okx.checked} candidates checked`);
   if (failClosed && gaps.audit.checked >= 3 && gaps.audit.missing === gaps.audit.checked) down.push(`Jupiter token-audit data was unavailable for all ${gaps.audit.checked} candidates checked`);
   const outage = down.length
     ? `${down.join("; ")}. With failClosedOnMissingData on, nothing can pass the safety screen until that data is back.`

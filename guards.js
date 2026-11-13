@@ -619,12 +619,18 @@ export function lockKey(name, args) {
  * authority, top-10 concentration. One function so that every way of reaching a deploy (scheduled cycle, chat,
  * Telegram, the `auto` command) runs the same checks.
  *
+ * Also the two checks that used to come from OKX alone: bundler holdings (maxBundlePct) and lifetime fees
+ * (minTokenFeesSol). OKX's values are used when it has them; otherwise Jupiter's own figures for the same
+ * things (audit.bundle_pct = bundlerStats.holdingPct, global_fees_sol). OKX made those endpoints paid
+ * (HTTP 402) in Nov 2026, so without OKX API keys the Jupiter figures are what is checked.
+ *
  * @param {object} p
- * @param {object|null} p.token  { launchpad, audit: { mint_disabled, freeze_disabled, top_holders_pct, bot_holders_pct } }
+ * @param {object|null} p.token  { launchpad, global_fees_sol, audit: { mint_disabled, freeze_disabled, top_holders_pct, bot_holders_pct, bundle_pct } }
  * @param {object} p.screening   config.screening
- * @returns {{ pass: true } | { pass: false, reason: string, missing?: true }}
+ * @param {object} [p.okx]       { bundle_pct, fees_sol } from OKX, either may be null
+ * @returns {{ pass: true, bundle_pct, fees_sol } | { pass: false, reason: string, missing?: true }}
  */
-export function checkTokenAudit({ token, screening: s = {} }) {
+export function checkTokenAudit({ token, screening: s = {}, okx = {} }) {
   const failClosed = s.failClosedOnMissingData !== false;
   const launchpad = token?.launchpad ?? null;
   if (launchpad && Array.isArray(s.blockedLaunchpads) && s.blockedLaunchpads.includes(launchpad)) {
@@ -649,5 +655,25 @@ export function checkTokenAudit({ token, screening: s = {} }) {
   if (s.maxTop10Pct != null && Number.isFinite(top10) && top10 > s.maxTop10Pct) {
     return { pass: false, reason: `top-10 holders ${top10}% > ${s.maxTop10Pct}%` };
   }
-  return { pass: true };
+  const first = (...vals) => {
+    for (const v of vals) if (v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v))) return Number(v);
+    return null;
+  };
+  const bundle = first(okx?.bundle_pct, audit.bundle_pct);
+  if (s.maxBundlePct != null) {
+    if (bundle == null) {
+      if (failClosed) return { pass: false, missing: true, reason: "bundler holdings unknown (failClosedOnMissingData)" };
+    } else if (bundle > s.maxBundlePct) {
+      return { pass: false, reason: `bundlers hold ${bundle}% > ${s.maxBundlePct}%` };
+    }
+  }
+  const fees = first(okx?.fees_sol, token?.global_fees_sol);
+  if (s.minTokenFeesSol != null) {
+    if (fees == null) {
+      if (failClosed) return { pass: false, missing: true, reason: "lifetime fees unknown (failClosedOnMissingData)" };
+    } else if (fees < s.minTokenFeesSol) {
+      return { pass: false, reason: `${fees.toFixed(1)} SOL lifetime fees below min ${s.minTokenFeesSol}` };
+    }
+  }
+  return { pass: true, bundle_pct: bundle, fees_sol: fees };
 }

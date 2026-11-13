@@ -45,6 +45,7 @@ export async function getTokenInfo({ query }) {
       freeze_disabled: t.audit.freezeAuthorityDisabled,
       top_holders_pct: t.audit.topHoldersPercentage?.toFixed(2),
       bot_holders_pct: t.audit.botHoldersPercentage?.toFixed(2),
+      bundle_pct: t.audit.bundlerStats?.holdingPct ?? null, // % of supply bundlers hold now (free; OKX's figure is paid)
       dev_migrations: t.audit.devMigrations,
     } : null,
     stats_1h: t.stats1h ? {
