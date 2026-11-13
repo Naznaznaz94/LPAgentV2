@@ -68,10 +68,12 @@ Runs one AI management cycle over open positions.
 Output: { done: true, report: "..." }
 \`\`\`
 
-### meridian deploy --pool <addr> --amount <sol> [--bins-below 69] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
+### meridian deploy --pool <addr> --amount <sol> [--bins-below N] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
 Deploys a new LP position. All safety checks apply.
+Without --bins-below the range is sized in code: its bottom sits 60-70% below the entry price (coverMinPct / coverMaxPct),
+using the pool's bin step and market cap from Meteora. With --bins-below your number is used as typed.
 \`\`\`
-Output: { success, position, pool_name, txs, price_range, bin_step }
+Output: { success, position, pool_name, txs, price_range, bin_step, bins_below, cover_pct }
 \`\`\`
 
 ### meridian claim --position <addr>

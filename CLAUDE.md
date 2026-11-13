@@ -26,7 +26,8 @@ tools/
   definitions.js    Tool schemas in OpenAI format (what LLM sees)
   executor.js       Tool dispatch: name → fn, safety checks, pre/post hooks
   dlmm.js           Meteora DLMM SDK wrapper (deploy, close, claim, positions, PnL)
-  screening.js      Pool discovery from Meteora API
+  screening.js      Pool discovery from Meteora API, entry rule, token audit
+  meteora.js        Meteora data API (dlmm.datapi.meteora.ag): pool candles for the pullback check, pool record
   wallet.js         SOL/token balances (Helius) + Jupiter swap
   token.js          Token info/holders/narrative (Jupiter API)
   study.js          Top LPer study via LPAgent API
@@ -88,6 +89,15 @@ Sets defined in `agent.js:6-7`. If you add a tool, also add it to the relevant s
 | positionSizePct | management | 0.35 |
 | minSolToOpen | management | 0.55 |
 | outOfRangeWaitMinutes | management | 30 |
+| outOfRangeAboveWaitMinutes | management | 120 |
+| bounceExit / bounceExitMinDepthPct / bounceExitPct / bounceExitDeepPct | management | true / 50 / 10 / 6 |
+| minAgeBeforeYieldCheck | management | 180 |
+| entryMode | screening | "dip" |
+| entryDipMinPct / entryDipMaxPct / entryDipLookbackHours | screening | 20 / 30 / 24 |
+| entrySettleMinutes / entrySettleBouncePct | screening | 15 / 2 |
+| entryMaxFall3dPct | screening | 50 |
+| rangeMode | strategy | "cover" |
+| coverMinPct / coverMaxPct / coverDeepBelowMcap / maxBinsBelow | strategy | 60 / 70 / 3,000,000 / 200 |
 | managementIntervalMin | schedule | 10 |
 | screeningIntervalMin | schedule | 30 |
 | managementModel / screeningModel / generalModel | llm | openrouter/healer-alpha |
@@ -138,17 +148,36 @@ Before `deploy_position` executes:
 
 ---
 
-## bins_below Calculation (SCREENER)
+## Entry, range and exit (all in `guards.js`, unit-tested)
 
-Linear formula based on pool volatility (set in screener prompt, `index.js`):
+**Entry — `checkDipEntry`** (`screening.entryMode: "dip"`, the default). `getTopCandidates()` reads each pool's
+candles from Meteora (`tools/meteora.js getDipFacts`: 1h candles of 3 days, plus 5m candles of 3 hours when the pool
+is near the zone) and `dipFromCandles` turns them into facts. A pool passes when price is
+`entryDipMinPct`–`entryDipMaxPct` below the highest candle body of the last `entryDipLookbackHours`, the last low is
+at least `entrySettleMinutes` old, price is `entrySettleBouncePct` off that low, and it is not more than
+`entryMaxFall3dPct` below its 3-day high. No Meteora candles → fallback facts from OKX's 24h high and the last step
+of the discovery `price_trend`. Neither → dropped (unless `failClosedOnMissingData` is off).
+`entryMode: "momentum"` keeps the old up/up filter.
+
+**Range — `checkDeploy`** (`strategy.rangeMode: "cover"`, the default):
 
 ```
-bins_below = round(35 + (volatility / 5) * 34), clamped to [35, 69]
+cover = coverMaxPct                                       if mcap < coverDeepBelowMcap, or mcap / volatility unknown
+      = coverMinPct + (min(volatility, 5) / 5) * (coverMaxPct - coverMinPct)   otherwise
+bins_below = ceil( ln(1 / (1 - cover/100)) / ln(1 + bin_step/10000) ), capped at maxBinsBelow
 ```
 
-- Low volatility (0) → 35 bins
-- High volatility (5+) → 69 bins
-- Any value in between is valid (continuous, not tiered)
+-60% at bin step 100 = 93 bins, -70% = 121, -70% at bin step 80 = 152. Anything above 69 bins goes through the
+wide-range path in `dlmm.js` (`createExtendedEmptyPosition` + `addLiquidityByStrategyChunkable`).
+The model's `bins_below` is ignored in the autonomous cycles; a range the owner types (CLI `--bins-below`, or a
+Telegram chat request) is kept. `rangeMode: "bins"` is the old `round(35 + (volatility / 5) * 34)` clamp.
+
+**Exit — `checkBounceExit`**, called from `state.js updatePnlAndCheckExits` (30s poller and management cycle).
+`state.json` keeps `low_bin`, the lowest active bin seen since the open. depth = (top bin − low bin) / range
+width; bounce = `(1 + bin_step/10000)^(active − low) − 1`. depth ≥ `bounceExitMinDepthPct` and bounce ≥
+`bounceExitPct` (or `bounceExitDeepPct` once depth ≥ 75%) → `BOUNCE_EXIT`. Order of the exits: stop loss, bounce
+exit, trailing TP, out of range (`outOfRangeAboveWaitMinutes` above the range, `outOfRangeWaitMinutes` below),
+low yield.
 
 ---
 

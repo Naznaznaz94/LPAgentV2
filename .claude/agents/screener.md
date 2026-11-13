@@ -100,6 +100,11 @@ Each strategy uses the gathered data differently. After choosing a strategy, fol
 capital in the token, so it carries the token's price risk from the first minute. Use them only when the owner
 has switched that on.
 
+**The agent's own default setup** (what `node cli.js deploy` does when you give it no range): SOL only, shape
+`bid_ask`, range bottom 60–70% below the entry price, and the scheduled screener only offers pools that have pulled
+back 20–30% from their 24h high and stopped falling. The tighter ranges described further down are for hands-on
+positions you watch yourself; pass `--bins-below` to use one.
+
 **Critical DLMM bin mechanics — never get this wrong:**
 - Bins BELOW the active bin hold token Y (SOL): that is where `amount_y` goes. They buy the token as price falls.
 - Bins ABOVE the active bin hold token X (the base token): that is where `amount_x` goes. They sell it as price rises.

@@ -106,6 +106,7 @@ export async function deployPosition({
   strategy,
   bins_below,
   bins_above,
+  cover_pct,  // how far below the entry price the range reaches, as sized by guards.js checkDeploy (for the record)
   // optional pool metadata for learning (passed by agent when available)
   pool_name,
   bin_step,
@@ -141,6 +142,7 @@ export async function deployPosition({
         strategy: activeStrategy,
         bins_below: activeBinsBelow,
         bins_above: activeBinsAbove,
+        cover_pct: cover_pct ?? null,
         amount_x: amount_x || 0,
         amount_y: amount_y || amount_sol || 0,
         wide_range: totalBins > 69,
@@ -211,7 +213,7 @@ export async function deployPosition({
   const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
-  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
+  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${cover_pct != null ? `, range bottom ${cover_pct}% below entry` : ""}${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
@@ -279,7 +281,7 @@ export async function deployPosition({
       base_mint: baseMint, // on-chain value; the caller's claim is not trusted
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
-      bin_step,
+      bin_step: onChainBinStep ?? bin_step, // the bounce exit turns bins into % with this: use the on-chain value
       volatility,
       fee_tvl_ratio,
       organic_score,
@@ -309,6 +311,8 @@ export async function deployPosition({
       bin_step: actualBinStep,
       base_fee: actualBaseFee,
       strategy: activeStrategy,
+      bins_below: activeBinsBelow,
+      cover_pct: cover_pct ?? null,
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
@@ -325,7 +329,7 @@ export async function deployPosition({
           position: newPosition.publicKey.toString(), pool: pool_address, pool_name, base_mint: baseMint,
           strategy: activeStrategy,
           bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
-          bin_step, volatility, fee_tvl_ratio, organic_score,
+          bin_step: onChainBinStep ?? bin_step, volatility, fee_tvl_ratio, organic_score,
           amount_sol: finalAmountY, amount_x: finalAmountX, active_bin: activeBin.binId, initial_value_usd,
         });
       } catch (e) {

@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { checkBounceExit } from "./guards.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, "state.json");
@@ -99,6 +100,8 @@ export function trackPosition({
     amount_sol,
     amount_x,
     active_bin_at_deploy: active_bin,
+    low_bin: active_bin ?? null,   // lowest active bin seen since the open (updatePnlAndCheckExits)
+    low_bin_at: null,
     bin_step,
     volatility,
     fee_tvl_ratio,
@@ -448,7 +451,7 @@ export function getStateSummary() {
  * Returns { action, reason } or null if no exit needed.
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
-  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h } = positionData;
+  const { pnl_pct: currentPnlPct, pnl_pct_suspicious, in_range, fee_per_tvl_24h, active_bin, lower_bin, upper_bin } = positionData;
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -484,6 +487,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     log("state", `Position ${position_address} back in range`);
   }
 
+  // Lowest price seen since the open, as a bin id. The bounce exit needs to know how deep price went.
+  if (Number.isFinite(active_bin) && (!Number.isFinite(pos.low_bin) || active_bin < pos.low_bin)) {
+    pos.low_bin = active_bin;
+    pos.low_bin_at = new Date().toISOString();
+    changed = true;
+  }
+
   if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
@@ -492,6 +502,19 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
       action: "STOP_LOSS",
       reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
     };
+  }
+
+  // ── Bounce exit: price went deep into the range and is coming back up ──
+  // The top of the range is the entry price for a SOL-only position; for a two-sided one the dump side starts
+  // at the entry price, not at the upper bin.
+  const topBin = Number.isFinite(pos.active_bin_at_deploy) && Number.isFinite(upper_bin)
+    ? Math.min(upper_bin, pos.active_bin_at_deploy)
+    : upper_bin;
+  const bounce = checkBounceExit(
+    { topBin, lowerBin: lower_bin, activeBin: active_bin, lowBin: pos.low_bin, binStep: pos.bin_step },
+    mgmtConfig);
+  if (bounce.exit) {
+    return { action: "BOUNCE_EXIT", reason: bounce.reason };
   }
 
   // ── Trailing TP ────────────────────────────────────────────────
@@ -513,10 +536,15 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
   // ── Out of range too long ──────────────────────────────────────
   if (pos.out_of_range_since) {
     const minutesOOR = Math.floor((Date.now() - new Date(pos.out_of_range_since).getTime()) / 60000);
-    if (minutesOOR >= mgmtConfig.outOfRangeWaitMinutes) {
+    // Above the range the position is all SOL and only idle; below it, it holds the token. Different waits.
+    const above = Number.isFinite(active_bin) && Number.isFinite(upper_bin) && active_bin > upper_bin;
+    const limit = above
+      ? (mgmtConfig.outOfRangeAboveWaitMinutes ?? mgmtConfig.outOfRangeWaitMinutes)
+      : mgmtConfig.outOfRangeWaitMinutes;
+    if (minutesOOR >= limit) {
       return {
         action: "OUT_OF_RANGE",
-        reason: `Out of range for ${minutesOOR}m (limit: ${mgmtConfig.outOfRangeWaitMinutes}m)`,
+        reason: `Out of range ${above ? "above (idle)" : "below"} for ${minutesOOR}m (limit: ${limit}m)`,
       };
     }
   }

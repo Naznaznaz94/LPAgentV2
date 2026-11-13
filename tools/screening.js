@@ -4,7 +4,8 @@ import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { getTokenInfo } from "./token.js";
-import { checkTokenAudit } from "../guards.js";
+import { checkTokenAudit, checkDipEntry } from "../guards.js";
+import { getDipFacts } from "./meteora.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -208,21 +209,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return false;
       }
       return true;
-    })
-    .slice(0, limit * 3); // keep 3× headroom — OKX filters reduce this to final limit
+    });
+  // (The cut to 3× the limit used to happen here. It now comes after the entry check below: only a few pools
+  // are inside the pullback zone at any moment, so every pool that passed the cheap filters gets looked at.)
 
-  // Price direction filter — requires REAL upward momentum before entry.
-  // bid_ask strategy needs confirmed buying pressure, not a dead-cat bounce off a single up candle.
-  //
-  // PASS conditions (any one qualifies):
-  //   (a) ALL candles are green (price in full uptrend across the window)    → up, up, up
-  //   (b) Last 2 candles both green: [n-3]→[n-2] up AND [n-2]→[n-1] up     → down, up, up
-  //   (c) Pullback then recovery: [n-3]→[n-2] up AND [n-2]→[n-1] down AND [n-1]→... wait —
-  //       i.e. [n-2] > [n-3] (first green) AND [n-1] < [n-2] (red dip) AND [n-1] > [n-3] (recovery above start) → BLOCKED
-  //       Correct form: last candle green AND second-to-last red AND third-to-last green
-  //       = [n-1] > [n-2]  AND  [n-2] < [n-3]  AND  [n-3] > [n-4]           → up, down, up
-  //
-  // If fewer than 3 valid data points exist, we can't verify the pattern → pass (no data).
   // failClosedOnMissingData (default on): a check that cannot run for lack of data drops the candidate. These
   // used to pass on "no data", so an OKX or price-feed outage switched the safety filters off.
   const failClosed = config.screening.failClosedOnMissingData !== false;
@@ -230,39 +220,63 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // source is down for every candidate the screen passes nobody; the result then says so (`outage`) instead of
   // looking like an ordinary quiet market.
   const gaps = { okx: { checked: 0, missing: 0 }, audit: { checked: 0, missing: 0 } };
-  eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-    const trend = p.price_trend;
-    const valid = Array.isArray(trend) ? trend.filter(v => v > 0) : []; // strip -1.0 placeholder values
-    if (valid.length < 3) { // need at least 3 points to see a pattern
-      if (!failClosed) return true;
-      pushFilteredReason(filteredOut, p, "price direction: not enough price points to check the entry pattern");
-      return false;
+
+  // ── Entry timing ────────────────────────────────────────────────
+  const entryMode = config.screening.entryMode ?? "dip";
+  const validTrend = (p) => (Array.isArray(p.price_trend) ? p.price_trend.filter((v) => v > 0) : []); // strip -1.0 placeholders
+  if (entryMode === "dip") {
+    // Wait for the pullback (guards.js checkDipEntry): price 20–30% below its recent high and no longer making
+    // new lows. Measured on the pool's own candles from Meteora (SOL per token, the price the range lives on).
+    // A SOL-only range opened at the top buys the day's most expensive tokens first; opened after the pullback
+    // it buys from a lower price and a retest of the low lands inside it.
+    const band = { min: config.screening.entryDipMinPct ?? 20, max: config.screening.entryDipMaxPct ?? 30 };
+    const lookbackHours = config.screening.entryDipLookbackHours ?? 24;
+    for (let i = 0; i < eligible.length; i += 5) { // small batches: polite to the API
+      await Promise.all(eligible.slice(i, i + 5).map(async (p) => {
+        try {
+          p.dip = await getDipFacts(p.pool, { lookbackHours, band });
+        } catch (e) {
+          p.dip = null;
+          log("screening", `Meteora candles unavailable for ${p.name}: ${e.message} — falling back to OKX's 24h high`);
+        }
+      }));
     }
-
-    const n = valid.length;
-
-    // (a) All consecutive candles rising → up, up, up
-    const allGreen = valid.every((v, i) => i === 0 || v > valid[i - 1]);
-
-    // (b) Last 2 candles both green → (anything), up, up
-    const lastTwoGreen = valid[n - 1] > valid[n - 2] && valid[n - 2] > valid[n - 3];
-
-    // (c) Pullback-recovery: last green, previous red, one before that green → up, down, up
-    //     Requires 4 data points to confirm the leading green candle.
-    const upDownUp = n >= 4
-      && valid[n - 1] > valid[n - 2]   // last candle: green
-      && valid[n - 2] < valid[n - 3]   // second-to-last: red (dip)
-      && valid[n - 3] > valid[n - 4];  // third-to-last: green (leading move)
-
-    if (!allGreen && !lastTwoGreen && !upDownUp) {
-      const tail = valid.slice(-4).map(v => v.toExponential(2)).join(" → ");
-      log("screening", `Price direction filter: dropped ${p.name} — need up/up, up/up/up, or up/down/up pattern (last 4: ${tail})`);
-      pushFilteredReason(filteredOut, p, "price direction: no valid entry pattern (blocked: not up/up, up/up/up, or up/down/up)");
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (!p.dip) return true; // no candles: decided after the OKX enrichment below
+      const v = checkDipEntry(p.dip, config.screening);
+      if (v.pass) return true;
+      log("screening", `Entry filter: dropped ${p.name} — ${v.reason}`);
+      pushFilteredReason(filteredOut, p, v.reason);
       return false;
-    }
-
-    return true;
-  }));
+    }));
+  } else {
+    // "momentum": the older rule. Price must be stepping up over the last candles of the discovery trend:
+    //   up, up, up  |  (anything), up, up  |  up, down, up
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      const valid = validTrend(p);
+      if (valid.length < 3) { // need at least 3 points to see a pattern
+        if (!failClosed) return true;
+        pushFilteredReason(filteredOut, p, "price direction: not enough price points to check the entry pattern");
+        return false;
+      }
+      const n = valid.length;
+      const allGreen = valid.every((v, i) => i === 0 || v > valid[i - 1]);
+      const lastTwoGreen = valid[n - 1] > valid[n - 2] && valid[n - 2] > valid[n - 3];
+      const upDownUp = n >= 4
+        && valid[n - 1] > valid[n - 2]   // last candle: green
+        && valid[n - 2] < valid[n - 3]   // second-to-last: red (dip)
+        && valid[n - 3] > valid[n - 4];  // third-to-last: green (leading move)
+      if (!allGreen && !lastTwoGreen && !upDownUp) {
+        const tail = valid.slice(-4).map(v => v.toExponential(2)).join(" → ");
+        log("screening", `Price direction filter: dropped ${p.name} — need up/up, up/up/up, or up/down/up pattern (last 4: ${tail})`);
+        pushFilteredReason(filteredOut, p, "price direction: no valid entry pattern (blocked: not up/up, up/up/up, or up/down/up)");
+        return false;
+      }
+      return true;
+    }));
+  }
+  // Keep 3× headroom for the OKX and audit filters below (4 OKX calls per pool: do not enrich the whole list).
+  if (eligible.length > limit * 3) eligible.splice(limit * 3);
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
@@ -325,6 +339,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
       }
     }
+    if (entryMode === "dip") {
+      // Pools Meteora had no candles for: measure the pullback from OKX's 24h high instead (a USD price across
+      // all venues), with the direction of the last price step standing in for "has it stopped falling".
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.dip) return true; // already passed on the pool's own candles
+        const t = validTrend(p);
+        const facts = p.price_vs_ath_pct != null
+          ? {
+              dipPct: Math.round((100 - p.price_vs_ath_pct) * 10) / 10,
+              lastStepUp: t.length >= 2 ? t[t.length - 1] > t[t.length - 2] : null,
+              source: "okx",
+            }
+          : null;
+        const v = checkDipEntry(facts, config.screening);
+        if (v.pass) { p.dip = facts; return true; }
+        if (v.unknown && !failClosed) return true; // the owner chose to let "no data" pass
+        log("screening", `Entry filter: dropped ${p.name} — ${v.reason}`);
+        pushFilteredReason(filteredOut, p, v.reason);
+        return false;
+      }));
+    }
+
     // Hard risk filters, in code. Wash trading = fake volume. A liquidity-removal (rug) flag and a honeypot tag
     // were only shown to the model before, with a prompt line that let "smart wallets" override a rug flag.
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
@@ -495,7 +531,8 @@ export function rememberScreened(pools) {
     if (!p?.pool) continue;
     _screened.set(p.pool, {
       pool: p.pool, name: p.name ?? null, bin_step: p.bin_step ?? null,
-      base_mint: p.base?.mint ?? null, volatility: p.volatility ?? null, at: now,
+      base_mint: p.base?.mint ?? null, volatility: p.volatility ?? null,
+      mcap: p.mcap ?? null, dip_pct: p.dip?.dipPct ?? null, at: now,
     });
   }
 }

@@ -182,6 +182,11 @@ export function recordPoolDeploy(poolAddress, deployData) {
     // Price pumped above range — already ran, give it 1h to settle before re-entering
     const cooldownUntil = setPoolCooldown(entry, 1, "pumped far above range");
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (pumped far above range)`);
+  } else if (closeText.includes("bounce exit")) {
+    // Price went deep into the range and the position left on the bounce: the token has just had a real dump.
+    // Stay out of this pool for a while; the pullback entry would not take it back at once anyway.
+    const cooldownUntil = setPoolCooldown(entry, 6, "bounce exit after a deep dip");
+    log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (bounce exit)`);
   } else if (closeText.includes("trailing tp") || closeText.includes("trailing take profit")) {
     // Took profit — let the pool breathe for 1h before re-entering
     const cooldownUntil = setPoolCooldown(entry, 1, "trailing TP taken");

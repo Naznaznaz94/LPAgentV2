@@ -28,12 +28,30 @@ Meridian runs a **ReAct agent loop** — each cycle the LLM reasons over live da
 
 **Data sources:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close transactions
-- Meteora DLMM PnL API — position yield, fee accrual, PnL
+- Meteora DLMM data API (`dlmm.datapi.meteora.ag`, free, no key) — open positions, position yield and PnL, and
+  the pool's own candles in SOL, which the entry rule is measured on
 - OKX OnchainOS — smart money signals, token risk scoring
 - Pool screening API — fee/TVL ratios, volume, organic scores, holder counts
 - Jupiter API — token audit, mcap, launchpad, price stats
 
 Agents are powered via **OpenRouter** and can be swapped for any compatible model.
+
+### The default setup: wait for the pullback, deep range, leave on the bounce
+
+All three parts are enforced in code (`guards.js`); the model only picks which of the passing pools to enter.
+
+| Step | Rule | Why |
+|---|---|---|
+| **Entry** | Not at the top. A pool is offered only when its price is **20–30% below its 24h high** and has **stopped making new lows** (no new low for 15 min and at least +2% off the low). A token down more than 50% from its 3-day high is skipped. | A SOL-only range starts buying at the entry price. Opened at the high, the first bins buy the day's most expensive tokens and an ordinary pullback already puts the position under water. Opened after the pullback, it buys from a lower price and a retest of the low lands inside the range. |
+| **Range** | SOL only, bottom **60–70% below the entry price**: the deep end for volatile pools and for market caps under $3M. Converted to bins for the pool's bin step (−60% at bin step 100 = 93 bins, −70% = 121). | Entering after a pullback means entering at a lower market cap, where falls are deeper. −65% below a price that is already 25% off the high reaches about −74% from the high. |
+| **Shape** | `bid_ask`: most of the SOL sits in the lower bins. | On a deep range it is the low-risk shape: a 40% fall into a −70% range costs about 3% of the position before fees with `bid_ask`, about 9% with `spot`. The price: fewer fees while price chops near the top of the range. |
+| **Exit** | Stop loss at −15% PnL (about three quarters of the way down a −70% `bid_ask` range). Trailing take-profit. **Bounce exit**: once price has been past half of the range, the first +10% bounce off the low closes the position (+6% once it has been past three quarters). Price above the range (idle, all SOL): closed after 120 min. | "Let it dump, leave on the bounce." Waiting for a full recovery from deep in the range is where the large losses come from. |
+
+The high is the highest candle *body* in the window, not the wick, and is read from the pool's own candles on
+Meteora (SOL per token). If Meteora has no candles for a pool, OKX's 24h high is used instead, with the direction
+of the last price step standing in for "has it stopped falling". With neither, the pool is skipped.
+
+To go back to the old behaviour set `"entryMode": "momentum"` and `"rangeMode": "bins"`.
 
 ---
 
@@ -400,6 +418,12 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxBundlersPct` | `30` | Maximum bundler % in top 100 holders |
 | `maxTop10Pct` | `60` | Maximum top-10 holder concentration |
 | `blockedLaunchpads` | `[]` | Launchpad names to never deploy into |
+| `entryMode` | `dip` | `dip` = wait for the pullback (below). `momentum` = the older rule: price stepping up over the last candles |
+| `entryDipMinPct` / `entryDipMaxPct` | `20` / `30` | The pullback zone: price must be this far below its recent high |
+| `entryDipLookbackHours` | `24` | Window the high is taken from |
+| `entrySettleMinutes` | `15` | No new low for this long before entering |
+| `entrySettleBouncePct` | `2` | Price must be at least this far back up off the low |
+| `entryMaxFall3dPct` | `50` | Skip a token down more than this from its 3-day high. `null` = off |
 
 ### Management
 
@@ -410,10 +434,20 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxDeployAmount` | `50` | Maximum SOL cap per position |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
-| `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
+| `outOfRangeWaitMinutes` | `30` | Minutes out of range **below** before closing |
+| `outOfRangeAboveWaitMinutes` | `120` | Minutes out of range **above** (idle, all SOL) before closing |
+| `bounceExit` | `true` | Leave on the bounce once price has been deep in the range |
+| `bounceExitMinDepthPct` | `50` | How far into the range the low must have gone |
+| `bounceExitPct` / `bounceExitDeepPct` | `10` / `6` | Bounce off the low that closes the position; the second applies past 75% of the range |
+| `minAgeBeforeYieldCheck` | `180` | Minutes before a low fee yield can close a position |
 | `stopLossPct` | `-15` | Close the position when its PnL falls to this % |
 | `minClaimAmountSol` | `0.05` | Claim threshold in SOL, used when `solMode` is on (`minClaimAmount` is USD) |
-| `minBinsBelow` | `35` | Narrowest range (bins below price), used at volatility 0; `binsBelow` is the widest |
+| `strategy` | `bid_ask` | Shape of the deposit: `bid_ask`, `spot` or `curve` |
+| `rangeMode` | `cover` | `cover` = range bottom `coverMinPct`–`coverMaxPct` below entry. `bins` = `minBinsBelow`–`binsBelow` bins by volatility |
+| `coverMinPct` / `coverMaxPct` | `60` / `70` | How far below the entry price the range reaches (calm pool / volatile pool) |
+| `coverDeepBelowMcap` | `3000000` | Market caps under this (USD) always get `coverMaxPct`. `null` = off |
+| `maxBinsBelow` | `200` | Hard cap on the number of bins, whatever the cover asks for |
+| `minBinsBelow` / `binsBelow` | `35` / `69` | Only for `rangeMode: "bins"`: narrowest and widest range |
 
 ### Safety switches
 
@@ -591,7 +625,8 @@ tools/
   definitions.js    Tool schemas (OpenAI format)
   executor.js       Tool dispatch + safety checks
   dlmm.js           Meteora DLMM SDK wrapper
-  screening.js      Pool discovery
+  screening.js      Pool discovery + entry rule + token audit
+  meteora.js        Meteora data API: pool candles (pullback check), pool record
   wallet.js         SOL/token balances + Jupiter swap
   token.js          Token info, holders, narrative
   study.js          Top LPer study via LPAgent API

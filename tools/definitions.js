@@ -135,9 +135,9 @@ HARD RULES:
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
 
 Guidelines (only when user hasn't specified):
-- Strategy: use the active strategy's lp_strategy field (bid_ask or spot)
-- Bins: choose 35–69 for standard volatility; up to 350 for wide-range strategies. Max 1400 total.
-- Deposit: Can be single-sided (SOL only or Base only) or dual-sided.
+- Strategy: use the configured shape (bid_ask unless told otherwise)
+- Range: leave bins_below out. The executor sizes the range in code: its bottom sits 60–70% below the entry price (deeper for volatile pools and small market caps), converted to bins for the pool's bin step.
+- Deposit: SOL only (amount_y) unless the owner has switched two-sided positions on.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -166,7 +166,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. If the user specifies a value, use it exactly. If they specify a % range (e.g. '-60% range'), convert using: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Example: -60% range at bin_step 100 → ceil(log(0.40)/log(1.01)) = 92 bins. Otherwise choose based on volatility: 35–69 standard, 100–350 for wide-range strategies. Max 1400 total."
+            description: "Number of bins below active bin. Leave it out in the autonomous cycles: the executor sizes the range itself and ignores this value there. Pass it only when the owner asks for a specific range in this chat. For a % range (e.g. '-60% range') convert with bins = ceil(log(1 / (1 - pct)) / log(1 + bin_step/10000)). Example: -60% at bin_step 100 → ceil(log(2.5)/log(1.01)) = 93 bins. Capped at maxBinsBelow."
           },
           bins_above: {
             type: "number",

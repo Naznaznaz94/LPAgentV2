@@ -23,6 +23,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "../config.js";
 import { checkDeploy, checkSwap, validateConfigChanges } from "../guards.js";
+import { getPoolFacts } from "./meteora.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -208,8 +209,27 @@ const toolMap = {
       maxSteps:        ["llm", "maxSteps"],
       // strategy
       strategy:  ["strategy", "strategy"],
+      rangeMode: ["strategy", "rangeMode"],
+      coverMinPct: ["strategy", "coverMinPct"],
+      coverMaxPct: ["strategy", "coverMaxPct"],
+      coverDeepBelowMcap: ["strategy", "coverDeepBelowMcap"],
+      maxBinsBelow: ["strategy", "maxBinsBelow"],
       binsBelow: ["strategy", "binsBelow"],
       minBinsBelow: ["strategy", "minBinsBelow"],
+      // entry timing
+      entryMode:             ["screening", "entryMode"],
+      entryDipMinPct:        ["screening", "entryDipMinPct"],
+      entryDipMaxPct:        ["screening", "entryDipMaxPct"],
+      entryDipLookbackHours: ["screening", "entryDipLookbackHours"],
+      entrySettleMinutes:    ["screening", "entrySettleMinutes"],
+      entrySettleBouncePct:  ["screening", "entrySettleBouncePct"],
+      entryMaxFall3dPct:     ["screening", "entryMaxFall3dPct"],
+      // exits added with the pullback entry
+      outOfRangeAboveWaitMinutes: ["management", "outOfRangeAboveWaitMinutes"],
+      bounceExit:            ["management", "bounceExit"],
+      bounceExitMinDepthPct: ["management", "bounceExitMinDepthPct"],
+      bounceExitPct:         ["management", "bounceExitPct"],
+      bounceExitDeepPct:     ["management", "bounceExitDeepPct"],
       maxSwapPriceImpactPct: ["risk", "maxSwapPriceImpactPct"],
     };
 
@@ -445,13 +465,31 @@ async function runSafetyChecks(name, args, ctx = {}) {
       // A deploy typed by the owner (cli.js) may name any pool and any size up to maxDeployAmount; everything
       // that comes through the model is tied to the screening result and to the computed position size.
       const human = ctx.source === "human";
+      const requireScreened = !human && config.risk.allowUnscreenedDeploy !== true;
+      let candidate = getScreenedCandidate(args.pool_address);
+      if (!candidate && !requireScreened) {
+        // A pool named by hand has no screening record. Read its bin step, market cap and base mint from
+        // Meteora's pool record so the range can still be sized in code.
+        try {
+          const facts = await getPoolFacts(args.pool_address);
+          if (facts.is_blacklisted) {
+            return { pass: false, reason: `Pool ${args.pool_address} is blacklisted by Meteora.` };
+          }
+          candidate = facts;
+        } catch (e) {
+          log("executor_warn", `Pool record unavailable for ${args.pool_address}: ${e.message}`);
+        }
+      }
       const verdict = checkDeploy({
         args,
-        candidate: getScreenedCandidate(args.pool_address),
+        candidate,
         cfg: config,
         openPositions: positions.unknown ? null : positions.positions,
         sizeCapSol: balance && !human ? computeDeployAmount(balance.sol) : null,
-        requireScreened: !human && config.risk.allowUnscreenedDeploy !== true,
+        requireScreened,
+        // A range the owner asked for himself (CLI, or a Telegram chat message) is kept as asked; in the
+        // autonomous cycles the range is always sized in code.
+        ownerRange: human || ctx.interactive === true,
       });
       if (!verdict.pass) return verdict;
       // Use the checked arguments from here on: bin step and base mint from the screening record, bins below

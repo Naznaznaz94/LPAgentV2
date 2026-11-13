@@ -182,6 +182,14 @@ function stopCronJobs() {
   if (prevPollInterval) clearInterval(prevPollInterval);
 }
 
+/** Minutes a position may stay out of range before it is closed: longer above the range (idle, all SOL) than below. */
+function oorLimitFor(p) {
+  const above = p.active_bin != null && p.upper_bin != null && p.active_bin > p.upper_bin;
+  return above
+    ? (config.management.outOfRangeAboveWaitMinutes ?? config.management.outOfRangeWaitMinutes)
+    : config.management.outOfRangeWaitMinutes;
+}
+
 /**
  * Try again to sell tokens whose swap back to SOL failed after a close (state.js pendingSwaps).
  * A token that an open position still uses is left alone. Gives up after PENDING_SWAP_MAX_ATTEMPTS and says so.
@@ -337,11 +345,12 @@ export async function runManagementCycle({ silent = false } = {}) {
           p.active_bin < p.lower_bin - config.management.outOfRangeBinsToClose) {
         return { action: "CLOSE", rule: 3, reason: "dumped far below range" };
       }
-      // Rule 4: stale out of range (above or below)
+      // Rule 4: stale out of range. Above the range the position is all SOL and only idle, so it gets the
+      // longer outOfRangeAboveWaitMinutes; below, it holds the token and gets outOfRangeWaitMinutes.
       if (p.active_bin != null && p.upper_bin != null && p.lower_bin != null &&
           (p.active_bin > p.upper_bin || p.active_bin < p.lower_bin) &&
-          (p.minutes_out_of_range ?? 0) >= config.management.outOfRangeWaitMinutes) {
-        return { action: "CLOSE", rule: 4, reason: "OOR" };
+          (p.minutes_out_of_range ?? 0) >= oorLimitFor(p)) {
+        return { action: "CLOSE", rule: 4, reason: p.active_bin > p.upper_bin ? "OOR above the range (idle)" : "OOR" };
       }
       // Rule 5: fee yield too low
       if (p.fee_per_tvl_24h != null &&
@@ -524,7 +533,7 @@ After executing, write a brief one-line result per position.
         [...actionMap.entries()].filter(([, a]) => a.action === "CLOSE" && !a.failed).map(([pos]) => pos)
       );
       for (const p of positions) {
-        if (!closedThisCycle.has(p.position) && !p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
+        if (!closedThisCycle.has(p.position) && !p.in_range && p.minutes_out_of_range >= oorLimitFor(p)) {
           notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
         }
       }
@@ -590,7 +599,15 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // (The default library strategy used to say "dual-sided" right next to steps that said "SOL only".)
     const strategyBlock = config.risk.allowTwoSided && activeStrategy
       ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-      : `POSITION SETUP (enforced in code): SOL only (amount_x = 0, bins_above = 0), shape ${config.strategy.strategy}. bins_below is computed by the executor from the pool's volatility.`;
+      : `POSITION SETUP (enforced in code): SOL only (amount_x = 0, bins_above = 0), shape ${config.strategy.strategy}. ${
+          (config.strategy.rangeMode ?? "cover") === "cover"
+            ? `The executor sizes the range: its bottom sits ${config.strategy.coverMinPct}–${config.strategy.coverMaxPct}% below the entry price (the deep end for volatile pools and small market caps).`
+            : "bins_below is computed by the executor from the pool's volatility."
+        }`;
+    const sc = config.screening;
+    const entryBlock = (sc.entryMode ?? "dip") === "dip"
+      ? `ENTRY RULE (enforced in code): every candidate below has pulled back ${sc.entryDipMinPct}–${sc.entryDipMaxPct}% from its ${sc.entryDipLookbackHours}h high and has stopped making new lows (see its "pullback" line). Do not look for tokens at their high. Pick the healthiest pullback: volume still alive, organic buyers, a real narrative.`
+      : "";
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch((e) => {
@@ -629,9 +646,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     if (passing.length === 0) {
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
-      const combinedExamples = combined
+      // With the pullback entry most pools are "waiting for a pullback" on any given check: show a few, count the rest.
+      const shown = combined.slice(0, 8);
+      const combinedExamples = shown
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
-        .join("\n");
+        .join("\n") + (combined.length > shown.length ? `\n- … and ${combined.length - shown.length} more` : "");
       screenReport = (topCandidates?.outage ? `⚠️ ${topCandidates.outage}\n\n` : "") + (combinedExamples
         ? `No candidates available.\nFiltered examples (${combined.length} total):\n${combinedExamples}`
         : topCandidates ? `No candidates available (nothing passed the screening rules).` : `No candidates available (the pool list could not be fetched).`);
@@ -680,6 +699,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags  ? `  tags: ${okxTags}` : null,
         pool.price_vs_ath_pct != null ? `  24h_high: price is ${pool.price_vs_ath_pct}% of the 24h high${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
+        pool.dip ? `  pullback: ${pool.dip.dipPct}% below the ${config.screening.entryDipLookbackHours}h high${
+          pool.dip.bouncePct != null ? `, +${pool.dip.bouncePct}% off the low, ${pool.dip.minsSinceLow} min since the low` : ""}${
+          pool.dip.fall3dPct != null ? `, ${pool.dip.fall3dPct}% below the 3-day high` : ""} (${pool.dip.source === "okx" ? "OKX 24h high, fallback" : "pool candles"})` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
@@ -714,6 +736,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
+${entryBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
@@ -727,7 +750,7 @@ STEPS:
    - amount_x: 0                 ← SOL-only, no base token
    - bins_above: 0               ← MANDATORY — never change this
    Only pools from the candidate list above can be deployed into; any other address is refused.
-   - bins_below: omit — the executor computes it from the pool's volatility
+   - bins_below: omit — the executor sizes the range in code
    - strategy: "${config.strategy.strategy}"
    - pool_name: <pool name>
    - base_mint: <base token mint>

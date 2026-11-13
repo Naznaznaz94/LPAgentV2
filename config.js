@@ -76,6 +76,19 @@ export const config = {
     minFeePct:          u.minFeePct          ?? 0.8,  // minimum pool base fee % (e.g. 0.8 = 0.8%)
     avoidPvpSymbols:    u.avoidPvpSymbols    ?? false, // enrich PVP risk data for candidates
     blockPvpSymbols:    u.blockPvpSymbols    ?? false, // hard-block pools flagged as PVP
+
+    // ── Entry timing ──
+    // "dip" (default): do not open at the top. Wait until the pool price has pulled back entryDipMinPct–
+    // entryDipMaxPct from its recent high and has stopped making new lows (guards.js checkDipEntry; candles from
+    // Meteora, OKX's 24h high as the fallback). "momentum": the older rule, price stepping up over the last candles.
+    entryMode:             u.entryMode             ?? "dip",
+    entryDipMinPct:        u.entryDipMinPct        ?? 20,
+    entryDipMaxPct:        u.entryDipMaxPct        ?? 30,
+    entryDipLookbackHours: u.entryDipLookbackHours ?? 24,  // the high is the highest candle body in this window
+    entrySettleMinutes:    u.entrySettleMinutes    ?? 15,  // no new low for this long…
+    entrySettleBouncePct:  u.entrySettleBouncePct  ?? 2,   // …and price at least this far back up off the low
+    // Skip a token that is down more than this from its 3-day high: that is a slide, not a pullback. null = off.
+    entryMaxFall3dPct:     u.entryMaxFall3dPct !== undefined ? u.entryMaxFall3dPct : 50,
   },
 
   // ─── Position Management ────────────────
@@ -97,7 +110,19 @@ export const config = {
     manageUntrackedPositions: u.manageUntrackedPositions ?? false,
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
-    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    // Minutes before low yield can close a position. 3 hours: a range opened after a pullback earns nothing until
+    // price comes back down into it, and closing it after one idle hour throws the setup away.
+    minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 180,
+    // Price ABOVE the range: the position is all SOL, nothing is at risk, it is only idle. Wait longer than for
+    // a break below before closing it and looking for another pool.
+    outOfRangeAboveWaitMinutes: u.outOfRangeAboveWaitMinutes ?? 120,
+    // "Let it dump, leave on the bounce" (guards.js checkBounceExit): once price has been past
+    // bounceExitMinDepthPct of the range, the first bounce of bounceExitPct closes the position; past three
+    // quarters of the range a bounce of bounceExitDeepPct is enough.
+    bounceExit:            u.bounceExit            ?? true,
+    bounceExitMinDepthPct: u.bounceExitMinDepthPct ?? 50,
+    bounceExitPct:         u.bounceExitPct         ?? 10,
+    bounceExitDeepPct:     u.bounceExitDeepPct     ?? 6,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -113,9 +138,23 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
+    // Shape of the SOL-only deposit. bid_ask puts most of the SOL in the lower bins: little is bought on a
+    // shallow dip, most near the bottom. On a deep range that is the low-risk shape (a 40% fall into a -70%
+    // range costs about 3% of the position before fees, against about 9% for spot); spot earns more fees while
+    // price chops near the top of the range.
     strategy:  u.strategy  ?? "bid_ask",
-    binsBelow: u.binsBelow ?? 69,          // widest range (bins below price), used at volatility 5+
-    minBinsBelow: u.minBinsBelow ?? 35,    // narrowest range, used at volatility 0
+    // How the range is sized (guards.js checkDeploy):
+    //   "cover" (default): the bottom of the range sits coverMinPct–coverMaxPct below the entry price. Deeper
+    //     for volatile pools; always the deep end for a market cap under coverDeepBelowMcap. The number of bins
+    //     follows from the pool's bin step (e.g. -65% at bin step 100 = 106 bins).
+    //   "bins": the older rule, minBinsBelow–binsBelow bins by volatility.
+    rangeMode:   u.rangeMode   ?? "cover",
+    coverMinPct: u.coverMinPct ?? 60,
+    coverMaxPct: u.coverMaxPct ?? 70,
+    coverDeepBelowMcap: u.coverDeepBelowMcap !== undefined ? u.coverDeepBelowMcap : 3_000_000, // USD; null = off
+    maxBinsBelow: u.maxBinsBelow ?? 200,   // hard cap on the range, whatever the cover asks for
+    binsBelow: u.binsBelow ?? 69,          // rangeMode "bins": widest range, used at volatility 5+
+    minBinsBelow: u.minBinsBelow ?? 35,    // rangeMode "bins": narrowest range, used at volatility 0
   },
 
   // ─── Scheduling ─────────────────────────
