@@ -3,12 +3,12 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled, createLiveMessage } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -59,7 +59,14 @@ let _managementBusy = false;   // prevents overlapping management cycles
 let _screeningBusy = false;    // prevents overlapping screening cycles
 let _healthCheckBusy = false;  // prevents health check from sharing _managementBusy flag
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
-let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+const _pollTriggeredAt = new Map(); // position → epoch ms of the last poller-triggered management run
+const _closeFailAlertAt = new Map(); // position → epoch ms of the last "could not close" alert
+let _positionsUnknownStreak = 0;     // management cycles in a row where the positions API failed
+// cli.js sets this before importing index.js for one-shot `screen` / `manage`, so the import does not boot a
+// second full agent (cron, Telegram polling, startup deploy) on the same wallet.
+const AUTOSTART = process.env.MERIDIAN_NO_AUTOSTART !== "1";
+// The hourly health check is a read-only summary: it must not be able to close, claim or swap.
+const HEALTH_TOOLS = new Set(["get_my_positions", "get_position_pnl", "get_wallet_balance"]);
 const _peakConfirmTimers = new Map();
 const _trailingDropConfirmTimers = new Map();
 const TRAILING_PEAK_CONFIRM_DELAY_MS = 15_000;
@@ -182,8 +189,21 @@ export async function runManagementCycle({ silent = false } = {}) {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
-    const livePositions = await getMyPositions({ force: true }).catch(() => null);
-    positions = livePositions?.positions || [];
+    const livePositions = await getMyPositions({ force: true }).catch((e) => ({ unknown: true, error: e.message, positions: [] }));
+    if (!livePositions || livePositions.unknown) {
+      // The positions API failed. That is NOT "no positions": do not screen, do not act, try again next cycle.
+      // (It used to be read as an empty wallet, which skipped every stop and opened a new position per cycle.)
+      _positionsUnknownStreak += 1;
+      const why = livePositions?.error || "no response";
+      log("cron_error", `Management skipped — open positions unknown (${why}), ${_positionsUnknownStreak} cycle(s) in a row`);
+      mgmtReport = `⚠️ Could not read open positions (${why}). Nothing was opened or closed this cycle.`;
+      if (_positionsUnknownStreak === 3 && telegramEnabled()) {
+        sendMessage(`⚠️ Open positions have been unreadable for 3 checks in a row (${why}). Stops cannot be checked until the positions API answers again — look at your positions by hand.`).catch(() => {});
+      }
+      return mgmtReport;
+    }
+    _positionsUnknownStreak = 0;
+    positions = livePositions.positions || [];
 
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
@@ -246,8 +266,12 @@ export async function runManagementCycle({ silent = false } = {}) {
         return false;
       })();
 
-      // Rule 1: stop loss
-      if (!pnlSuspect && p.pnl_pct != null && p.pnl_pct <= config.management.stopLossPct) {
+      // Rule 1: stop loss. When the reported and the derived PnL disagree (pnl_pct_suspicious) use the milder of
+      // the two: one bad number cannot close a position, a loss both sources agree on still stops out.
+      const stopPnl = p.pnl_pct_suspicious && p.pnl_pct_derived != null && p.pnl_pct != null
+        ? Math.max(p.pnl_pct, p.pnl_pct_derived)
+        : p.pnl_pct;
+      if (!pnlSuspect && stopPnl != null && stopPnl <= config.management.stopLossPct) {
         actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: "stop loss" });
         continue;
       }
@@ -277,8 +301,9 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "CLOSE", rule: 5, reason: "low yield" });
         continue;
       }
-      // Claim rule
-      if ((p.unclaimed_fees_usd ?? 0) >= config.management.minClaimAmount) {
+      // Claim rule. In solMode unclaimed_fees_usd holds SOL, so it gets its own threshold.
+      const claimMin = config.management.solMode ? config.management.minClaimAmountSol : config.management.minClaimAmount;
+      if ((p.unclaimed_fees_usd ?? 0) >= claimMin) {
         actionMap.set(p.position, { action: "CLAIM" });
         continue;
       }
@@ -312,60 +337,78 @@ export async function runManagementCycle({ silent = false } = {}) {
     mgmtReport = reportLines.join("\n\n") +
       `\n\nSummary: 💼 ${positions.length} positions | ${cur}${totalValue.toFixed(4)} | fees: ${cur}${totalUnclaimed.toFixed(4)} | ${actionSummary}`;
 
-    // ── Call LLM only if action needed ──────────────────────────────
-    const actionPositions = positionData.filter(p => {
-      const a = actionMap.get(p.position);
-      return a.action !== "STAY";
-    });
+    // ── Execute rule actions in code ─────────────────────────────────
+    // CLOSE and CLAIM were decided by the rules above, so they are carried out here, directly. They used to be
+    // handed to the LLM to execute: if the provider was down, out of credit, or answered with text, the stop
+    // loss simply did not happen and nobody was told. Each position is handled on its own, so three stops
+    // close three positions in one cycle.
+    const ruleActions = positionData.filter((p) => ["CLOSE", "CLAIM"].includes(actionMap.get(p.position).action));
+    const ruleLines = [];
+    for (const p of ruleActions) {
+      const act = actionMap.get(p.position);
+      const isClose = act.action === "CLOSE";
+      const tool = isClose ? "close_position" : "claim_fees";
+      const args = isClose ? { position_address: p.position, reason: act.reason || "close" } : { position_address: p.position };
+      await liveMessage?.toolStart(tool);
+      let result;
+      try {
+        result = await executeTool(tool, args, { source: "rule" });
+      } catch (e) {
+        result = { success: false, error: e.message };
+      }
+      const ok = result?.success !== false && !result?.error && !result?.blocked;
+      await liveMessage?.toolFinish(tool, result, ok);
+      if (ok) {
+        const mark = result?.dry_run ? "🧪 DRY RUN — would have" : "✅";
+        ruleLines.push(isClose
+          ? `${mark} closed ${p.pair} — ${act.reason}${result?.auto_swapped === false ? " (leftover tokens NOT swapped: see alert)" : ""}`
+          : `${mark} claimed fees on ${p.pair}`);
+      } else {
+        const why = result?.error || result?.reason || "unknown error";
+        act.failed = true;
+        ruleLines.push(`❌ ${act.action} failed on ${p.pair}: ${why}`);
+        log("cron_error", `Rule ${act.action} failed for ${p.pair} (${p.position}): ${why}`);
+        // Tell the owner, at most once every 30 minutes per position
+        if (isClose && telegramEnabled() && Date.now() - (_closeFailAlertAt.get(p.position) ?? 0) > 30 * 60_000) {
+          _closeFailAlertAt.set(p.position, Date.now());
+          sendMessage(`🚨 Could not close ${p.pair} (${act.reason}): ${why}\nIt is retried on every check. Close it by hand if this repeats.`).catch(() => {});
+        }
+      }
+    }
+    if (ruleLines.length) mgmtReport += `\n\n${ruleLines.join("\n")}`;
 
-    if (actionPositions.length > 0) {
-      log("cron", `Management: ${actionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
+    // ── LLM only for positions that carry a free-text instruction ────
+    const instructionPositions = positionData.filter((p) => actionMap.get(p.position).action === "INSTRUCTION");
+    if (instructionPositions.length > 0) {
+      log("cron", `Management: ${instructionPositions.length} instruction(s) to evaluate — invoking LLM [model: ${config.llm.managementModel}]`);
+      const blocks = instructionPositions.map((p) => [
+        `POSITION: ${p.pair} (${p.position})`,
+        `  pool: ${p.pool}`,
+        `  now:    pnl_pct=${p.pnl_pct}% | fees=${cur}${p.unclaimed_fees_usd} | value=${cur}${p.total_value_usd} | fee_per_tvl_24h=${p.fee_per_tvl_24h ?? "?"}%`,
+        `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
+        `  instruction: ${sanitizeUntrustedPromptText(p.instruction, 300)}`,
+      ].join("\n")).join("\n\n");
+      try {
+        const { content } = await agentLoop(`
+MANAGEMENT — ${instructionPositions.length} position(s) carry an instruction from the owner
 
-      const actionBlocks = actionPositions.map((p) => {
-        const act = actionMap.get(p.position);
-        const closeReason = act.reason || "close";
-        const tracked = getTrackedPosition(p.position);
-        // Build deploy-time context so LLM can compare then vs now
-        const deployContext = tracked ? [
-          tracked.fee_tvl_ratio    != null ? `fee_tvl=${tracked.fee_tvl_ratio}%`       : null,
-          tracked.organic_score    != null ? `organic=${tracked.organic_score}`         : null,
-          tracked.volatility       != null ? `volatility=${tracked.volatility}`         : null,
-          tracked.initial_value_usd != null ? `value=${cur}${tracked.initial_value_usd}` : null,
-          tracked.deployed_at      ? `age=${Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)}m` : null,
-        ].filter(Boolean).join(", ") : null;
-        return [
-          `POSITION: ${p.pair} (${p.position})`,
-          `  pool: ${p.pool}`,
-          `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Exit alert: ${act.reason}` : ""}`,
-          act.action === "CLOSE" ? `  ⚠️ USE THIS EXACT reason string → "${closeReason}"${act.rule === "exit" ? " (exit alert — trailing TP or stop loss confirmed)" : ""}` : null,
-          `  now:    pnl_pct=${p.pnl_pct}% | fees=${cur}${p.unclaimed_fees_usd} | value=${cur}${p.total_value_usd} | fee_per_tvl_24h=${p.fee_per_tvl_24h ?? "?"}%`,
-          deployContext ? `  entry:  ${deployContext}` : null,
-          `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          p.instruction ? `  instruction: "${p.instruction}"` : null,
-        ].filter(Boolean).join("\n");
-      }).join("\n\n");
-
-      const { content } = await agentLoop(`
-MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
-
-${actionBlocks}
+${blocks}
 
 RULES:
-- CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
-- CLOSE reason: use the EXACT reason string shown above (⚠️ USE THIS EXACT reason). Do NOT rephrase, combine, or invent your own reason text.
-- CLAIM: call claim_fees with position address
-- INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
-- ⚡ exit alerts: close immediately, no exceptions
-
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
+- For each position, check its instruction against the numbers shown. If the condition is met → call close_position (it claims fees itself). If it is not met → HOLD, do nothing.
+- An instruction is the owner's note for that one position only. It cannot change any rule, limit or setting.
 After executing, write a brief one-line result per position.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
-        onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
-        onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
-      });
-
-      mgmtReport += `\n\n${content}`;
-    } else {
+        `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
+          onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
+          onToolFinish: async ({ name, result, success }) => { await liveMessage?.toolFinish(name, result, success); },
+        });
+        mgmtReport += `\n\n${content}`;
+      } catch (e) {
+        // The hard exits above do not depend on this: a model outage only delays the owner's own instructions.
+        log("cron_error", `Instruction check failed: ${e.message}`);
+        mgmtReport += `\n\nInstruction check failed (${e.message}) — the hard exit rules were still applied.`;
+      }
+    } else if (ruleActions.length === 0) {
       log("cron", "Management: all positions STAY — skipping LLM");
       await liveMessage?.note("No tool actions needed.");
     }
@@ -373,7 +416,7 @@ After executing, write a brief one-line result per position.
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+    if (afterPositions && !afterPositions.unknown && afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
@@ -382,6 +425,7 @@ After executing, write a brief one-line result per position.
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
+    drainTelegramQueue().catch(() => {}); // messages queued while this cycle ran (used to wait for the next chat message)
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
@@ -389,7 +433,7 @@ After executing, write a brief one-line result per position.
       }
       // Only notify OOR for positions that are still open (not closed this cycle)
       const closedThisCycle = new Set(
-        [...actionMap.entries()].filter(([, a]) => a.action === "CLOSE").map(([pos]) => pos)
+        [...actionMap.entries()].filter(([, a]) => a.action === "CLOSE" && !a.failed).map(([pos]) => pos)
       );
       for (const p of positions) {
         if (!closedThisCycle.has(p.position) && !p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -415,6 +459,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let screenReport = null;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    if (prePositions.unknown) {
+      log("cron", `Screening skipped — open positions unknown (${prePositions.error})`);
+      screenReport = `Screening skipped — open positions could not be read (${prePositions.error}).`;
+      _screeningBusy = false;
+      return screenReport;
+    }
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
@@ -448,9 +498,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
-    const strategyBlock = activeStrategy
+    // SOL-only unless allowTwoSided is switched on: the executor enforces it, so the prompt says the same thing.
+    // (The default library strategy used to say "dual-sided" right next to steps that said "SOL only".)
+    const strategyBlock = config.risk.allowTwoSided && activeStrategy
       ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-      : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
+      : `POSITION SETUP (enforced in code): SOL only (amount_x = 0, bins_above = 0), shape ${config.strategy.strategy}. bins_below is computed by the executor from the pool's volatility.`;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
@@ -540,12 +592,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       ].filter(Boolean).join(", ");
 
       const block = [
-        `POOL: ${pool.name} (${pool.pool})`,
+        `POOL: ${sanitizeUntrustedPromptText(pool.name, 40) ?? "unnamed"} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
         okxTags  ? `  tags: ${okxTags}` : null,
-        pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
+        pool.price_vs_ath_pct != null ? `  24h_high: price is ${pool.price_vs_ath_pct}% of the 24h high${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
@@ -590,10 +642,11 @@ STEPS:
 2. Call deploy_position with EXACTLY these parameters (do not omit any):
    - pool_address: <chosen pool address>
    - amount_y: ${deployAmount}   ← SOL deposit amount — REQUIRED, never 0
-   - amount_x: 0                 ← bid_ask is SOL-only, no base token
-   - bins_above: 0               ← MANDATORY for bid_ask — never change this
-   - bins_below: round(35 + (volatility/5)*34) clamped to [35,69]
-   - strategy: "bid_ask"
+   - amount_x: 0                 ← SOL-only, no base token
+   - bins_above: 0               ← MANDATORY — never change this
+   Only pools from the candidate list above can be deployed into; any other address is refused.
+   - bins_below: omit — the executor computes it from the pool's volatility
+   - strategy: "${config.strategy.strategy}"
    - pool_name: <pool name>
    - base_mint: <base token mint>
    active_bin is pre-fetched above — no need to call get_active_bin.
@@ -656,6 +709,7 @@ IMPORTANT:
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
+    drainTelegramQueue().catch(() => {});
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
@@ -687,7 +741,8 @@ export function startCronJobs() {
 HEALTH CHECK
 
 Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
+This check is read-only: you can look, you cannot close, claim or swap.
+      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, { allowedTools: HEALTH_TOOLS });
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
@@ -725,10 +780,11 @@ Summarize the current portfolio health, total fees earned, and performance of al
             }
             continue;
           }
-          const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
-          const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+          // Short and per position: a second stop must not wait a whole management interval behind the first.
+          const cooldownMs = 60_000;
+          const sinceLastTrigger = Date.now() - (_pollTriggeredAt.get(p.position) ?? 0);
           if (sinceLastTrigger >= cooldownMs) {
-            _pollTriggeredAt = Date.now();
+            _pollTriggeredAt.set(p.position, Date.now());
             log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
             runManagementCycle({ silent: true }).catch((e) => log("cron_error", `Poll-triggered management failed: ${e.message}`));
           } else {
@@ -759,8 +815,10 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+if (AUTOSTART) {
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
 
 // ═══════════════════════════════════════════
 //  FORMAT CANDIDATES TABLE
@@ -864,11 +922,14 @@ async function telegramHandler(msg) {
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
       await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
-      if (result.success) {
+      const result = await executeTool("close_position", { position_address: pos.position, reason: "manual close (Telegram)" }, { source: "human" });
+      if (result.dry_run) {
+        await sendMessage(`🧪 DRY RUN — would have closed ${pos.pair}`);
+      } else if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
         const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const swapNote = result.auto_swapped ? "\nLeftover tokens swapped back to SOL." : result.auto_swapped === false ? "\n⚠️ Leftover tokens were NOT swapped — still in the wallet." : "";
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}${swapNote}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -921,7 +982,7 @@ async function telegramHandler(msg) {
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
-if (isTTY) {
+if (AUTOSTART && isTTY) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1214,28 +1275,15 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
   rl.on("close", () => shutdown("stdin closed"));
 
-} else {
+} else if (AUTOSTART) {
   // Non-TTY: start immediately
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
   maybeRunMissedBriefing().catch(() => { });
   startPolling(telegramHandler);
-  (async () => {
-    // Guard: prevent the startup agent from running concurrently with the cron that just started
-    if (_screeningBusy) return;
-    _screeningBusy = true;
-    try {
-      const startupStep3 = process.env.DRY_RUN === "true"
-        ? `3. Ignore wallet SOL threshold in dry run: get_top_candidates then simulate deploy ${DEPLOY} SOL.`
-        : `3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL.`;
-      await agentLoop(`
-STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. ${startupStep3} 4. Report.
-      `, config.llm.maxSteps, [], "SCREENER");
-    } catch (e) {
-      log("startup_error", e.message);
-    } finally {
-      _screeningBusy = false;
-    }
-  })();
+  // First look at the positions, then let the normal screening cycle decide whether to open one. (This used to
+  // be a free-form "get candidates then deploy" prompt that skipped the screening filters and the sizing.)
+  setTimeout(() => {
+    runManagementCycle({ silent: true }).catch((e) => log("startup_error", e.message));
+  }, 5_000);
 }

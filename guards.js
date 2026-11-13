@@ -226,11 +226,15 @@ export function binsBelowFor(volatility, min = 35, max = 69) {
  * @param {object|null} p.candidate    this pool's record from the last screening run ({ pool, name, bin_step, base_mint, volatility }) or null
  * @param {object} p.cfg               { risk, screening, management, strategy } from config.js
  * @param {Array|null} p.openPositions [{ pool, base_mint }] or null when the positions API failed
- * @param {number|null} p.sizeCapSol   computeDeployAmount(wallet SOL), or null when the balance is unknown (dry run)
+ * @param {number|null} p.sizeCapSol   computeDeployAmount(wallet SOL); null = no size cap beyond maxDeployAmount
+ *                                     (dry run, or a deploy typed by the owner at the CLI)
+ * @param {boolean} [p.requireScreened] pool must be in the latest screening result. Default: on, unless
+ *                                     allowUnscreenedDeploy. The executor turns it off for the owner's own CLI deploys.
  * @returns {{ pass: false, reason: string } | { pass: true, args: object }}
  */
-export function checkDeploy({ args = {}, candidate = null, cfg, openPositions, sizeCapSol = null }) {
+export function checkDeploy({ args = {}, candidate = null, cfg, openPositions, sizeCapSol = null, requireScreened }) {
   const risk = cfg.risk || {};
+  if (requireScreened === undefined) requireScreened = risk.allowUnscreenedDeploy !== true;
   const twoSided = risk.allowTwoSided === true;
 
   if (!args.pool_address || typeof args.pool_address !== "string") {
@@ -239,7 +243,7 @@ export function checkDeploy({ args = {}, candidate = null, cfg, openPositions, s
   if (!Array.isArray(openPositions)) {
     return { pass: false, reason: "Open positions could not be read (API error), so the position count and duplicate checks cannot run. Not deploying blind — retry next cycle." };
   }
-  if (!candidate && risk.allowUnscreenedDeploy !== true) {
+  if (!candidate && requireScreened) {
     return { pass: false, reason: `Pool ${args.pool_address} is not in the latest screening result. Only screened pools can be deployed into (run get_top_candidates again, or set allowUnscreenedDeploy to deploy by hand).` };
   }
 

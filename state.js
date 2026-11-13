@@ -37,7 +37,15 @@ function load() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
+    // Keep the unreadable file: the next save() would otherwise replace it with an empty registry and every
+    // tracked position (trailing peaks, out-of-range timers, instructions) would be gone for good.
+    const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+    try {
+      fs.copyFileSync(STATE_FILE, backup);
+      log("state_error", `state.json is unreadable (${err.message}) — copied to ${path.basename(backup)}, starting from an empty registry`);
+    } catch (copyErr) {
+      log("state_error", `Failed to read state.json: ${err.message}; backup also failed: ${copyErr.message}`);
+    }
     return { positions: {}, recentEvents: [], lastUpdated: null };
   }
 }
@@ -45,7 +53,9 @@ function load() {
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const tmp = `${STATE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, STATE_FILE);
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
@@ -440,14 +450,13 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (pos.confirmed_trailing_exit_until) {
     if (new Date(pos.confirmed_trailing_exit_until).getTime() > Date.now() && pos.confirmed_trailing_exit_reason) {
-      const reason = pos.confirmed_trailing_exit_reason;
-      pos.confirmed_trailing_exit_reason = null;
-      pos.confirmed_trailing_exit_until = null;
-      save(state);
-      return { action: "TRAILING_TP", reason, confirmed_recheck: true };
+      // Not cleared on read: the poller sees it first, the management cycle that closes must see it too.
+      // It ends when the position is closed, or when the window below runs out.
+      return { action: "TRAILING_TP", reason: pos.confirmed_trailing_exit_reason, confirmed_recheck: true };
     }
     pos.confirmed_trailing_exit_reason = null;
     pos.confirmed_trailing_exit_until = null;
+    save(state);
   }
 
   let changed = false;

@@ -82,6 +82,7 @@ test("deploy: blocked when positions are unknown, pool is unscreened, or limits 
   assert.match(checkDeploy({ ...base, openPositions: null }).reason, /could not be read/);
   assert.match(checkDeploy({ ...base, candidate: null }).reason, /not in the latest screening/);
   assert.equal(checkDeploy({ ...base, candidate: null, args: { ...good, bin_step: 100 }, cfg: cfg({ risk: { allowUnscreenedDeploy: true } }) }).pass, true);
+  assert.equal(checkDeploy({ ...base, candidate: null, requireScreened: false }).pass, true);   // the owner at the CLI
   assert.match(checkDeploy({ ...base, openPositions: [{}, {}, {}] }).reason, /Max positions/);
   assert.match(checkDeploy({ ...base, openPositions: [{ pool: "POOL1" }] }).reason, /duplicate/);
   assert.match(checkDeploy({ ...base, openPositions: [{ pool: "OTHER", base_mint: "MINT1" }] }).reason, /One position per token/);

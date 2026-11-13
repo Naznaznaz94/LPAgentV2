@@ -437,12 +437,16 @@ async function runSafetyChecks(name, args, ctx = {}) {
         }
       }
       args.pool_address = normalizeMint(args.pool_address);
+      // A deploy typed by the owner (cli.js) may name any pool and any size up to maxDeployAmount; everything
+      // that comes through the model is tied to the screening result and to the computed position size.
+      const human = ctx.source === "human";
       const verdict = checkDeploy({
         args,
         candidate: getScreenedCandidate(args.pool_address),
         cfg: config,
         openPositions: positions.unknown ? null : positions.positions,
-        sizeCapSol: balance ? computeDeployAmount(balance.sol) : null,
+        sizeCapSol: balance && !human ? computeDeployAmount(balance.sol) : null,
+        requireScreened: !human && config.risk.allowUnscreenedDeploy !== true,
       });
       if (!verdict.pass) return verdict;
       // Use the checked arguments from here on: bin step and base mint from the screening record, bins below
