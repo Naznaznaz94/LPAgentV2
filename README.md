@@ -122,6 +122,30 @@ npm start      # live mode
 
 On startup Meridian fetches your wallet balance, open positions, and top pool candidates, then begins autonomous cycles immediately.
 
+### Run on a VPS (24/7)
+
+On a fresh Ubuntu 22.04 / 24.04 server (2 GB RAM is plenty):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Naznaznaz94/LPAgentV2/main/deploy/vps-setup.sh && bash vps-setup.sh
+```
+
+[`deploy/vps-setup.sh`](deploy/vps-setup.sh) installs Node.js 22, closes every port except SSH, puts the code in
+`/opt/meridian` under its own `meridian` user, and adds a `meridian` systemd service that restarts the agent after
+a crash or a reboot. It does not start trading: `.env` is written with empty keys and `DRY_RUN=true`, and
+`user-config.json` with `"dryRun": true` and sizes for a small test wallet (~3 SOL: two positions of ~1–1.2 SOL,
+1.5 SOL cap, 0.3 SOL reserve, 4h screening window). Then:
+
+```bash
+sudo -u meridian nano /opt/meridian/.env    # keys: use a NEW wallet that holds only the test SOL
+sudo systemctl start meridian               # dry run
+journalctl -u meridian -f                   # watch
+sudo bash /opt/meridian/deploy/vps-setup.sh # update to the latest code later
+```
+
+The wallet key sits on the server, so treat it as a hot wallet: a fresh wallet funded with only what you are
+willing to test with, SSH-key login, and `TELEGRAM_ALLOWED_USER_IDS` set to your own id only.
+
 ---
 
 ## Running modes
